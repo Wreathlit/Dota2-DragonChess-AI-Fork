@@ -14,6 +14,7 @@ It will help you beat the game.
 3. Move the mouse over `Play` on game page, then press `b` to start.
 4. Watch it play.
 5. Use `p` (or `q`, for compatibility) to pause/unpause the program, use `esc` to exit the program.
+7. You can also press `Ctrl+C` in terminal to stop the program safely during debugging.
 6. The agent will automatically detect the Dota2 window and calibrate board position.
 
 
@@ -33,7 +34,19 @@ Search depth for move planning. Recommended `3~4`. Default: `3`.
 Disable waiting for board settling after each swap.
 
 `--settle_timeout`,
-Maximum seconds to wait for board settling after each swap. Default: `2.0`.
+Maximum seconds to wait for board settling after each swap. Default: `1.6`.
+
+`--disable_auto_recalibrate`,
+Disable the default-on automatic board recalibration (secondary calibration based on recognition quality).
+
+`--recalibrate_interval`,
+Run automatic recalibration every N cycles. Default: `15`.
+
+`--perf`,
+Enable per-step runtime profiling and periodic summary output.
+
+`--perf_every`,
+Print performance summary every N cycles when `--perf` is enabled. Default: `10`.
 
 You can take a screenshot and paste it to Windows paint to find out the coordinates (as shown below). 
 ![board_example.png](board_example.png)

@@ -20,14 +20,69 @@ WINDOW_TITLE_EXCLUDES = ["visual studio code", "cursor", "pycharm", "notepad++",
 DEFAULT_MATCH_CONFIDENCE = 0.72
 DEFAULT_ACTION_DELAY = 0.5
 DEFAULT_LOOKAHEAD_DEPTH = 3
-DEFAULT_SETTLE_TIMEOUT = 2.0
-HSV_SAT_THRESHOLD = 40
-HSV_VAL_THRESHOLD = 35
+DEFAULT_SETTLE_TIMEOUT = 1.6
+DEFAULT_PERF_SUMMARY_EVERY = 10
+DEFAULT_SETTLE_POLL_INTERVAL = 0.035
+DEFAULT_SETTLE_STABLE_FRAMES = 3
+DEFAULT_SETTLE_DIFF_THRESHOLD = 2.4
+DEFAULT_SETTLE_DOWNSCALE = 56
+DEFAULT_AUTO_RECALIBRATE = True
+DEFAULT_RECALIBRATE_INTERVAL = 15
+DEFAULT_RECALIBRATE_PADDING = 14
+DEFAULT_RECALIBRATE_STEP = 4
+DEFAULT_RECALIBRATE_BAD_SCORE = 0.43
+HSV_SAT_THRESHOLD = 35
+HSV_VAL_THRESHOLD = 30
 MORPH_KERNEL_SIZE = 3
 MIN_CONTOUR_AREA = 8.0
 HUE_HIST_BINS = 30
-HUE_WEIGHT = 0.75
-SHAPE_WEIGHT = 0.25
+SAT_HIST_BINS = 32
+HUE_WEIGHT = 0.35
+SAT_WEIGHT = 0.30
+SHAPE_WEIGHT = 0.15
+EDGE_WEIGHT = 0.20
+STANDARD_OBJECT_RATIO = 0.68
+
+
+class PerfTracker:
+    def __init__(self, enabled=False, summary_every=10):
+        self.enabled = bool(enabled)
+        self.summary_every = max(1, int(summary_every))
+        self._metrics = defaultdict(list)
+        self._cycles = 0
+        self._action_cycles = 0
+        self._skipped_cycles = 0
+
+    def add(self, name, seconds):
+        if not self.enabled:
+            return
+        self._metrics[name].append(float(seconds) * 1000.0)
+
+    def mark_cycle(self, action_taken=False, skipped=False):
+        if not self.enabled:
+            return
+        self._cycles += 1
+        if action_taken:
+            self._action_cycles += 1
+        if skipped:
+            self._skipped_cycles += 1
+
+        if self._cycles % self.summary_every == 0:
+            self.print_summary()
+
+    def print_summary(self):
+        if not self.enabled:
+            return
+        print("\n[PERF] ===== cycle profile summary =====")
+        print(f"[PERF] cycles={self._cycles}, action_cycles={self._action_cycles}, skipped={self._skipped_cycles}")
+        for name in sorted(self._metrics.keys()):
+            values = self._metrics[name]
+            if not values:
+                continue
+            avg_ms = sum(values) / len(values)
+            max_ms = max(values)
+            print(f"[PERF] {name}: avg={avg_ms:.2f}ms max={max_ms:.2f}ms count={len(values)}")
+        print("[PERF] =================================")
 
 
 def on_press(key):
@@ -277,17 +332,33 @@ def choose_action_with_repeat_guard(agent, actions, board_signature, last_board_
     return action, False
 
 
-def execute_action_cycle(agent, action, disable_wait_settle, settle_timeout):
+def execute_action_cycle(agent, action, disable_wait_settle, settle_timeout, perf_tracker=None):
+    t_take = time.perf_counter()
     action = agent.take_action(action)
+    if perf_tracker is not None:
+        perf_tracker.add("take_action", time.perf_counter() - t_take)
+
     if action and not disable_wait_settle:
+        t_wait = time.perf_counter()
         settled = agent.wait_until_board_settled(timeout=settle_timeout)
+        if perf_tracker is not None:
+            perf_tracker.add("wait_board_settle", time.perf_counter() - t_wait)
         if not settled:
             print("Board settle wait timeout; continue with next cycle.")
     return action
 
 
-def print_cycle_log(elem_array, action, confidence_score, elapsed_sec):
+def print_cycle_log(elem_array, elem_sub_array, action, confidence_score, elapsed_sec):
+    def format_subclass(code):
+        code = int(code)
+        if code <= 0:
+            return "0_0"
+        return f"{code // 10}_{code % 10}"
+
     print(elem_array)
+    print("subclass")
+    formatted = np.vectorize(format_subclass)(elem_sub_array)
+    print(formatted)
     print('action', action)
     print('confidence', round(float(confidence_score), 4))
     print('time cost', elapsed_sec)
@@ -302,7 +373,7 @@ def wait_for_start_signal():
 
 
 def run_main_cycle(agent, wait_static, lookahead_depth, disable_wait_settle, settle_timeout,
-                   last_board_signature, last_action):
+                   last_board_signature, last_action, perf_tracker=None):
     if stop_agent:
         print("Program stopped by user.")
         return True, last_board_signature, last_action
@@ -312,14 +383,37 @@ def run_main_cycle(agent, wait_static, lookahead_depth, disable_wait_settle, set
         time.sleep(1)
         return False, last_board_signature, last_action
 
+    t_cycle = time.perf_counter()
     t1 = time.time()
+    agent._cycle_index += 1
     avg_confidence_score = agent.refresh_board_state()
+    if perf_tracker is not None:
+        perf_tracker.add("refresh_board_state", time.perf_counter() - t_cycle)
+
+    if agent.should_attempt_recalibrate(avg_confidence_score):
+        t_recal = time.perf_counter()
+        recalibrated_score = agent.try_recalibrate_region(avg_confidence_score)
+        if perf_tracker is not None:
+            perf_tracker.add("recalibrate_total", time.perf_counter() - t_recal)
+        if recalibrated_score is not None:
+            t_refresh = time.perf_counter()
+            avg_confidence_score = agent.refresh_board_state()
+            if perf_tracker is not None:
+                perf_tracker.add("refresh_after_recalibrate", time.perf_counter() - t_refresh)
     should_act = agent.should_take_action(wait_static)
     if not should_act:
+        if perf_tracker is not None:
+            perf_tracker.add("cycle_total", time.perf_counter() - t_cycle)
+            perf_tracker.mark_cycle(action_taken=False, skipped=True)
         return False, last_board_signature, last_action
 
+    t_actions = time.perf_counter()
     actions = agent.get_action()
-    board_signature = agent.elem_array.tobytes()
+    if perf_tracker is not None:
+        perf_tracker.add("get_action_candidates", time.perf_counter() - t_actions)
+
+    board_signature = agent.elem_array.tobytes() + agent.elem_sub_array.tobytes()
+    t_choose = time.perf_counter()
     action, should_skip = choose_action_with_repeat_guard(
         agent=agent,
         actions=actions,
@@ -328,18 +422,30 @@ def run_main_cycle(agent, wait_static, lookahead_depth, disable_wait_settle, set
         last_action=last_action,
         lookahead_depth=lookahead_depth
     )
+    if perf_tracker is not None:
+        perf_tracker.add("choose_best_action", time.perf_counter() - t_choose)
+
     if should_skip:
         time.sleep(0.08)
+        if perf_tracker is not None:
+            perf_tracker.add("cycle_total", time.perf_counter() - t_cycle)
+            perf_tracker.mark_cycle(action_taken=False, skipped=True)
         return False, last_board_signature, last_action
 
     action = execute_action_cycle(
         agent=agent,
         action=action,
         disable_wait_settle=disable_wait_settle,
-        settle_timeout=settle_timeout
+        settle_timeout=settle_timeout,
+        perf_tracker=perf_tracker
     )
+    if perf_tracker is not None:
+        perf_tracker.add("cycle_total", time.perf_counter() - t_cycle)
+        perf_tracker.mark_cycle(action_taken=bool(action), skipped=False)
+
     print_cycle_log(
         elem_array=agent.elem_array,
+        elem_sub_array=agent.elem_sub_array,
         action=action,
         confidence_score=avg_confidence_score,
         elapsed_sec=time.time() - t1
@@ -354,6 +460,9 @@ class ElementMatcher:
         self._type_variant_images = defaultdict(list)
         self._base_template_contours = {}
         self._base_template_hists = {}
+        self._base_template_sat_hists = {}
+        self._base_template_edges = {}
+        self._type_variant_features = {}
         self._build_base_templates_by_type()
 
     def _build_base_templates_by_type(self):
@@ -380,6 +489,44 @@ class ElementMatcher:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         return crop, mask
+
+    def _standardize_by_contour(self, image, target_width, target_height):
+        """
+        Normalize piece scale/position using the largest contour:
+        extract object bbox -> resize to a fixed ratio -> center on black canvas.
+        """
+        crop, mask = self._extract_piece_mask(image)
+        if crop is None or mask is None:
+            return cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return cv2.resize(crop, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+        contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(contour) < MIN_CONTOUR_AREA:
+            return cv2.resize(crop, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+        x, y, w, h = cv2.boundingRect(contour)
+        obj = crop[y:y + h, x:x + w]
+        obj_mask = mask[y:y + h, x:x + w]
+        obj_fg = cv2.bitwise_and(obj, obj, mask=obj_mask)
+
+        max_side = max(1, int(min(target_width, target_height) * STANDARD_OBJECT_RATIO))
+        scale = max_side / max(1, max(w, h))
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        obj_fg = cv2.resize(obj_fg, (new_w, new_h), interpolation=interp)
+        obj_mask = cv2.resize(obj_mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+        canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+        offset_x = (target_width - new_w) // 2
+        offset_y = (target_height - new_h) // 2
+        roi = canvas[offset_y:offset_y + new_h, offset_x:offset_x + new_w]
+        roi[obj_mask > 0] = obj_fg[obj_mask > 0]
+        return canvas
 
     def _extract_main_contour(self, image):
         crop, mask = self._extract_piece_mask(image)
@@ -411,10 +558,40 @@ class ElementMatcher:
         cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
         return hist
 
+    def _extract_sat_hist(self, image):
+        crop, mask = self._extract_piece_mask(image)
+        if crop is None or mask is None:
+            return None
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        if cv2.countNonZero(mask) < 10:
+            return None
+
+        hist = cv2.calcHist([hsv], [1], mask, [SAT_HIST_BINS], [0, 256])
+        if hist is None:
+            return None
+        cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+        return hist
+
+    def _extract_edge_map(self, image):
+        crop, mask = self._extract_piece_mask(image)
+        if crop is None or mask is None:
+            return None
+
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        gray = cv2.bitwise_and(gray, gray, mask=mask)
+        edge = cv2.Canny(gray, 50, 140)
+        if edge is None:
+            return None
+        return edge
+
     def set_grid_size(self, width, height):
         self._grid_size = (width, height)
         self._base_template_contours = {}
         self._base_template_hists = {}
+        self._base_template_sat_hists = {}
+        self._base_template_edges = {}
+        self._type_variant_features = {}
 
         for piece_type in range(1, 7):
             variants = self._type_variant_images.get(piece_type, [])
@@ -434,31 +611,88 @@ class ElementMatcher:
             contour = self._extract_main_contour(contour_image)
             if contour is not None:
                 self._base_template_contours[piece_type] = contour
+            edge = self._extract_edge_map(contour_image)
+            if edge is not None:
+                self._base_template_edges[piece_type] = edge
 
             # Hue template uses all variants for robustness.
             hist_list = []
+            sat_hist_list = []
+            variant_features = []
             for _, img in variants:
+                variant_name = _.strip()
+                try:
+                    variant_idx = int(variant_name.split("_")[1])
+                except (ValueError, IndexError):
+                    variant_idx = 1
+                variant_code = piece_type * 10 + variant_idx
+
                 resized = cv2.resize(img, (width, height), interpolation=cv2.INTER_AREA)
-                hist = self._extract_hue_hist(resized)
+                standardized = self._standardize_by_contour(resized, width, height)
+                hist = self._extract_hue_hist(standardized)
+                sat_hist = self._extract_sat_hist(standardized)
+                v_contour = self._extract_main_contour(standardized)
+                v_edge = self._extract_edge_map(standardized)
                 if hist is not None:
                     hist_list.append(hist)
+                if sat_hist is not None:
+                    sat_hist_list.append(sat_hist)
+                variant_features.append((variant_code, hist, sat_hist, v_contour, v_edge))
             if hist_list:
                 hist_avg = np.mean(np.stack(hist_list, axis=0), axis=0)
                 cv2.normalize(hist_avg, hist_avg, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
                 self._base_template_hists[piece_type] = hist_avg
+            if sat_hist_list:
+                sat_hist_avg = np.mean(np.stack(sat_hist_list, axis=0), axis=0)
+                cv2.normalize(sat_hist_avg, sat_hist_avg, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+                self._base_template_sat_hists[piece_type] = sat_hist_avg
+            if variant_features:
+                self._type_variant_features[piece_type] = variant_features
+
+    @staticmethod
+    def _calc_feature_score(
+            grid_hist, grid_sat_hist, contour, grid_edge,
+            template_hist, template_sat_hist, template_contour, template_edge):
+        hue_score = 1.0
+        sat_score = 1.0
+        shape_score = 1.0
+        edge_score = 1.0
+
+        if grid_hist is not None and template_hist is not None:
+            hue_score = cv2.compareHist(grid_hist, template_hist, cv2.HISTCMP_BHATTACHARYYA)
+        if grid_sat_hist is not None and template_sat_hist is not None:
+            sat_score = cv2.compareHist(grid_sat_hist, template_sat_hist, cv2.HISTCMP_BHATTACHARYYA)
+
+        if contour is not None and template_contour is not None:
+            shape_score = cv2.matchShapes(contour, template_contour, cv2.CONTOURS_MATCH_I1, 0.0)
+            shape_score = min(1.0, float(shape_score) * 2.0)
+
+        if grid_edge is not None and template_edge is not None:
+            if template_edge.shape == grid_edge.shape:
+                edge_score = cv2.norm(grid_edge, template_edge, cv2.NORM_L1) / (255.0 * grid_edge.size)
+            else:
+                resized_template_edge = cv2.resize(template_edge, (grid_edge.shape[1], grid_edge.shape[0]))
+                edge_score = cv2.norm(grid_edge, resized_template_edge, cv2.NORM_L1) / (255.0 * grid_edge.size)
+
+        return HUE_WEIGHT * hue_score + SAT_WEIGHT * sat_score + SHAPE_WEIGHT * shape_score + EDGE_WEIGHT * edge_score
 
     def classify_grids(self, grids):
         labels = np.zeros(len(grids), dtype=np.int32)
+        subclass_labels = np.zeros(len(grids), dtype=np.int32)
         scores = np.ones(len(grids), dtype=np.float32)
 
         if not self._base_template_hists:
-            return labels, scores
+            return labels, subclass_labels, scores
 
         for i, grid in enumerate(grids):
+            # Keep runtime grid in native appearance; only templates are standardized.
             grid_hist = self._extract_hue_hist(grid)
+            grid_sat_hist = self._extract_sat_hist(grid)
             contour = self._extract_main_contour(grid)
-            if grid_hist is None and contour is None:
+            grid_edge = self._extract_edge_map(grid)
+            if grid_hist is None and grid_sat_hist is None and contour is None:
                 labels[i] = 0
+                subclass_labels[i] = 0
                 scores[i] = 1.0
                 continue
 
@@ -466,36 +700,50 @@ class ElementMatcher:
             best_score = float("inf")
 
             for piece_type in range(1, 7):
-                hue_score = 1.0
-                shape_score = 1.0
-
-                if grid_hist is not None and piece_type in self._base_template_hists:
-                    hue_score = cv2.compareHist(grid_hist, self._base_template_hists[piece_type], cv2.HISTCMP_BHATTACHARYYA)
-
-                if contour is not None and piece_type in self._base_template_contours:
-                    shape_score = cv2.matchShapes(contour, self._base_template_contours[piece_type], cv2.CONTOURS_MATCH_I1, 0.0)
-
-                # Color first, shape as tie-break/fallback.
-                score = HUE_WEIGHT * hue_score + SHAPE_WEIGHT * shape_score
+                score = self._calc_feature_score(
+                    grid_hist, grid_sat_hist, contour, grid_edge,
+                    self._base_template_hists.get(piece_type),
+                    self._base_template_sat_hists.get(piece_type),
+                    self._base_template_contours.get(piece_type),
+                    self._base_template_edges.get(piece_type)
+                )
                 if score < best_score:
                     best_score = float(score)
                     best_type = piece_type
 
+            best_variant_code = best_type * 10 + 1
+            best_variant_score = float("inf")
+            for variant_code, v_hist, v_sat_hist, v_contour, v_edge in self._type_variant_features.get(best_type, []):
+                variant_score = self._calc_feature_score(
+                    grid_hist, grid_sat_hist, contour, grid_edge,
+                    v_hist, v_sat_hist, v_contour, v_edge
+                )
+                if variant_score < best_variant_score:
+                    best_variant_score = float(variant_score)
+                    best_variant_code = int(variant_code)
+
             labels[i] = best_type - 1
+            subclass_labels[i] = best_variant_code
             scores[i] = float(min(1.0, best_score))
 
-        return labels, scores
+        return labels, subclass_labels, scores
 
 
 class MatchThreeAgent:
     ROW_NUM = 8
     COL_NUM = 8
 
-    def __init__(self, top_left, bottom_right, elem_images, action_delay=0.5):
+    def __init__(self, top_left, bottom_right, elem_images, action_delay=0.5,
+                 auto_recalibrate=DEFAULT_AUTO_RECALIBRATE,
+                 recalibrate_interval=DEFAULT_RECALIBRATE_INTERVAL):
         self.prev_elem_array = None
         self.elem_array = np.zeros((8, 8), dtype=np.int64)
+        self.elem_sub_array = np.zeros((8, 8), dtype=np.int64)
         self._grid_height = None
         self._grid_width = None
+        self._x_edges = None
+        self._y_edges = None
+        self._board_shape = None
         self._grid_location = {}
         self._top_left = top_left
         self._bottom_right = bottom_right
@@ -505,8 +753,15 @@ class MatchThreeAgent:
         self._rollout_samples = 8
         self._rollout_topk = 4
         self._root_evaluation_cap = 6
+        self._auto_recalibrate = bool(auto_recalibrate)
+        self._recalibrate_interval = max(1, int(recalibrate_interval))
+        self._cycle_index = 0
+        self._perf_tracker = None
         # self._elem_images = elem_images
         self._element_matcher = ElementMatcher(elem_images)
+
+    def set_perf_tracker(self, perf_tracker):
+        self._perf_tracker = perf_tracker
 
     def identify_game_board(self):
         x, y, w, h = self._top_left[0], self._top_left[1], self._bottom_right[0], self._bottom_right[1]
@@ -514,15 +769,134 @@ class MatchThreeAgent:
         board_array = get_image_array(board)
         return board_array
 
+    def _update_grid_locations(self):
+        if self._x_edges is None or self._y_edges is None:
+            return
+        for i in range(self.ROW_NUM):
+            for j in range(self.COL_NUM):
+                start_x, end_x = int(self._x_edges[j]), int(self._x_edges[j + 1])
+                start_y, end_y = int(self._y_edges[i]), int(self._y_edges[i + 1])
+                center_x = int(round(self._top_left[0] + (start_x + end_x) / 2.0))
+                center_y = int(round(self._top_left[1] + (start_y + end_y) / 2.0))
+                self._grid_location[(i, j)] = (center_x, center_y)
+
     def refresh_board_state(self):
+        t_cap = time.perf_counter()
         board_array = self.identify_game_board()
+        if self._perf_tracker is not None:
+            self._perf_tracker.add("capture_board", time.perf_counter() - t_cap)
+
+        t_split = time.perf_counter()
         grids = self.split_board_into_grids(board_array)
+        if self._perf_tracker is not None:
+            self._perf_tracker.add("split_grids", time.perf_counter() - t_split)
+
+        t_update = time.perf_counter()
         self.update_elements(grids)
+        if self._perf_tracker is not None:
+            self._perf_tracker.add("update_elements", time.perf_counter() - t_update)
         return self.get_confidence_score()
 
     def should_take_action(self, wait_static):
+        t_gate = time.perf_counter()
         board_static = (self.prev_elem_array is None or np.array_equal(self.prev_elem_array, self.elem_array))
-        return (not wait_static) or board_static
+        should_act = (not wait_static) or board_static
+        if self._perf_tracker is not None:
+            self._perf_tracker.add("wait_static_gate", time.perf_counter() - t_gate)
+        return should_act
+
+    def should_attempt_recalibrate(self, avg_confidence_score):
+        if not self._auto_recalibrate:
+            return False
+        if self._cycle_index % self._recalibrate_interval == 0:
+            return True
+        return float(avg_confidence_score) >= DEFAULT_RECALIBRATE_BAD_SCORE
+
+    def _split_board_into_grids_local(self, board_array):
+        h, w, _ = board_array.shape
+        x_edges = np.rint(np.linspace(0, w, self.COL_NUM + 1)).astype(np.int32)
+        y_edges = np.rint(np.linspace(0, h, self.ROW_NUM + 1)).astype(np.int32)
+        grids = []
+        for i in range(self.ROW_NUM):
+            for j in range(self.COL_NUM):
+                sx, ex = int(x_edges[j]), int(x_edges[j + 1])
+                sy, ey = int(y_edges[i]), int(y_edges[i + 1])
+                grids.append(board_array[sy:ey, sx:ex])
+        return grids
+
+    def _count_action_candidates_on_board(self, board_array):
+        self.elem_array = board_array
+        return len(self.get_action())
+
+    def try_recalibrate_region(self, current_score):
+        x1, y1 = self._top_left
+        x2, y2 = self._bottom_right
+        board_w, board_h = x2 - x1, y2 - y1
+        if board_w < 100 or board_h < 100:
+            return None
+
+        pad = DEFAULT_RECALIBRATE_PADDING
+        origin_x = max(0, x1 - pad)
+        origin_y = max(0, y1 - pad)
+        cap_w = board_w + pad * 2
+        cap_h = board_h + pad * 2
+
+        t_cap = time.perf_counter()
+        search_image = capture_screen_array(region=(origin_x, origin_y, cap_w, cap_h))
+        if self._perf_tracker is not None:
+            self._perf_tracker.add("recalibrate_capture", time.perf_counter() - t_cap)
+
+        shifts = [
+            (0, 0),
+            (-DEFAULT_RECALIBRATE_STEP, 0), (DEFAULT_RECALIBRATE_STEP, 0),
+            (0, -DEFAULT_RECALIBRATE_STEP), (0, DEFAULT_RECALIBRATE_STEP),
+            (-DEFAULT_RECALIBRATE_STEP, -DEFAULT_RECALIBRATE_STEP),
+            (-DEFAULT_RECALIBRATE_STEP, DEFAULT_RECALIBRATE_STEP),
+            (DEFAULT_RECALIBRATE_STEP, -DEFAULT_RECALIBRATE_STEP),
+            (DEFAULT_RECALIBRATE_STEP, DEFAULT_RECALIBRATE_STEP),
+        ]
+
+        current_board = self.elem_array.copy()
+        best_quality = -float(current_score)
+        best_shift = (0, 0)
+        best_score = float(current_score)
+
+        t_eval = time.perf_counter()
+        for dx, dy in shifts:
+            sx = (x1 + dx) - origin_x
+            sy = (y1 + dy) - origin_y
+            ex = sx + board_w
+            ey = sy + board_h
+            if sx < 0 or sy < 0 or ex > search_image.shape[1] or ey > search_image.shape[0]:
+                continue
+
+            board = search_image[sy:ey, sx:ex]
+            grids = self._split_board_into_grids_local(board)
+            labels, _, scores = self._element_matcher.classify_grids(grids)
+            candidate_elem = labels.reshape((self.ROW_NUM, self.COL_NUM)) + 1
+            candidate_score = float(np.mean(scores))
+            actions_count = self._count_action_candidates_on_board(candidate_elem.copy())
+            candidate_quality = -candidate_score + min(40, actions_count) * 0.0015
+
+            if candidate_quality > best_quality:
+                best_quality = candidate_quality
+                best_shift = (dx, dy)
+                best_score = candidate_score
+
+        self.elem_array = current_board
+        if self._perf_tracker is not None:
+            self._perf_tracker.add("recalibrate_evaluate", time.perf_counter() - t_eval)
+
+        if best_shift == (0, 0):
+            return None
+        if (float(current_score) - best_score) < 0.006:
+            return None
+
+        self._top_left = (x1 + best_shift[0], y1 + best_shift[1])
+        self._bottom_right = (x2 + best_shift[0], y2 + best_shift[1])
+        self._update_grid_locations()
+        print(f"Auto recalibrated board shift dx={best_shift[0]}, dy={best_shift[1]}, score {current_score:.4f}->{best_score:.4f}")
+        return best_score
 
     @staticmethod
     def normalize_action(action):
@@ -533,16 +907,30 @@ class MatchThreeAgent:
             (int(action[1][0]), int(action[1][1]))
         )
 
-    def wait_until_board_settled(self, timeout=2.0, poll_interval=0.06, stable_frames=3, diff_threshold=2.0):
+    def wait_until_board_settled(
+            self,
+            timeout=DEFAULT_SETTLE_TIMEOUT,
+            poll_interval=DEFAULT_SETTLE_POLL_INTERVAL,
+            stable_frames=DEFAULT_SETTLE_STABLE_FRAMES,
+            diff_threshold=DEFAULT_SETTLE_DIFF_THRESHOLD):
         start_ts = time.time()
         prev_gray = None
         stable_count = 0
 
         while time.time() - start_ts < timeout:
             board = self.identify_game_board()
-            # Downscale to reduce computation and make settle detection cheaper.
-            small_board = cv2.resize(board, (64, 64), interpolation=cv2.INTER_AREA)
-            cur_gray = cv2.cvtColor(small_board, cv2.COLOR_BGR2GRAY)
+            # Downscale + center crop + blur for robust settle check against UI particles.
+            small_board = cv2.resize(
+                board,
+                (DEFAULT_SETTLE_DOWNSCALE, DEFAULT_SETTLE_DOWNSCALE),
+                interpolation=cv2.INTER_AREA
+            )
+            h, w = small_board.shape[:2]
+            margin_h = max(1, int(h * 0.1))
+            margin_w = max(1, int(w * 0.1))
+            center_roi = small_board[margin_h:h - margin_h, margin_w:w - margin_w]
+            cur_gray = cv2.cvtColor(center_roi, cv2.COLOR_BGR2GRAY)
+            cur_gray = cv2.GaussianBlur(cur_gray, (3, 3), 0)
 
             if prev_gray is not None:
                 diff = cv2.absdiff(cur_gray, prev_gray)
@@ -564,14 +952,14 @@ class MatchThreeAgent:
         height, width, _ = grid_array.shape
 
         # Initialize grid location on the screen
-        if self._grid_height is None:
-            self._grid_height = height // self.ROW_NUM
-            self._grid_width = width // self.COL_NUM
+        if self._board_shape != (height, width):
+            self._board_shape = (height, width)
+            self._x_edges = np.rint(np.linspace(0, width, self.COL_NUM + 1)).astype(np.int32)
+            self._y_edges = np.rint(np.linspace(0, height, self.ROW_NUM + 1)).astype(np.int32)
+            self._grid_width = int(round(width / self.COL_NUM))
+            self._grid_height = int(round(height / self.ROW_NUM))
             self._element_matcher.set_grid_size(self._grid_width, self._grid_height)
-            for i in range(self.ROW_NUM):
-                for j in range(self.COL_NUM):
-                    self._grid_location[(i, j)] = (self._top_left[0] + j * self._grid_width + self._grid_width / 2,
-                                                   self._top_left[1] + i * self._grid_height + self._grid_height / 2)
+            self._update_grid_locations()
             # for elem_name, image in self._elem_images.items():
             #     self._elem_images[elem_name] = cv2.resize(image, (self._grid_width, self._grid_height))  # unused
 
@@ -579,26 +967,31 @@ class MatchThreeAgent:
         for i in range(self.ROW_NUM):
             for j in range(self.COL_NUM):
                 x_margin, y_margin = 0, 0
-                start_x, end_x = int(j * self._grid_width + x_margin), int((j + 1) * self._grid_width - x_margin)
-                start_y, end_y = int(i * self._grid_height + y_margin), int((i + 1) * self._grid_height - y_margin)
+                start_x = int(self._x_edges[j] + x_margin)
+                end_x = int(self._x_edges[j + 1] - x_margin)
+                start_y = int(self._y_edges[i] + y_margin)
+                end_y = int(self._y_edges[i + 1] - y_margin)
                 grid = grid_array[start_y:end_y, start_x:end_x]
                 grids.append(grid)
 
         return grids
 
     def update_elements(self, grids):
-        labels, scores = self._element_matcher.classify_grids(grids)
+        labels, subclass_labels, scores = self._element_matcher.classify_grids(grids)
 
         elem_array = np.zeros((8, 8), dtype=np.int64)
+        elem_sub_array = np.zeros((8, 8), dtype=np.int64)
 
         self._scores = []
-        for i, (label, score) in enumerate(zip(labels, scores)):
+        for i, (label, subclass_label, score) in enumerate(zip(labels, subclass_labels, scores)):
             row, col = i // 8, i % 8
             elem_array[row, col] = int(label) + 1
+            elem_sub_array[row, col] = int(subclass_label)
             self._scores.append(float(score))
 
         self.prev_elem_array = self.elem_array
         self.elem_array = elem_array
+        self.elem_sub_array = elem_sub_array
 
     def get_grid_element(self, index):
         if 0 <= index[0] < self.ROW_NUM and 0 <= index[1] < self.COL_NUM:
@@ -938,9 +1331,12 @@ class MatchThreeAgent:
             if index1 == index2:
                 pyautogui.click(index1[0], index1[1])
                 return
-            pyautogui.moveTo(index1[0], index1[1])
+            # Use a deliberate drag gesture to improve swap reliability.
+            pyautogui.moveTo(index1[0], index1[1], duration=0.04)
             pyautogui.mouseDown()
-            pyautogui.moveTo(index2[0], index2[1], duration=0.22)
+            time.sleep(0.025)
+            pyautogui.moveTo(index2[0], index2[1], duration=0.18)
+            time.sleep(0.015)
             pyautogui.mouseUp()
 
         if not action:
@@ -956,7 +1352,10 @@ class MatchThreeAgent:
         return np.mean(self._scores)
 
 
-def run(wait_static, show, action_delay, lookahead_depth, disable_wait_settle, settle_timeout):
+def run(wait_static, show, action_delay, lookahead_depth, disable_wait_settle, settle_timeout,
+        perf=False, perf_every=DEFAULT_PERF_SUMMARY_EVERY,
+        auto_recalibrate=DEFAULT_AUTO_RECALIBRATE,
+        recalibrate_interval=DEFAULT_RECALIBRATE_INTERVAL):
     wait_for_start_signal()
 
     cur_path = sys.argv[0]
@@ -967,22 +1366,35 @@ def run(wait_static, show, action_delay, lookahead_depth, disable_wait_settle, s
     show_board_if_needed(show, top_left, bottom_right)
 
     elem_images = load_elem_images(resource_dir)
-    agent = MatchThreeAgent(top_left, bottom_right, elem_images, action_delay=action_delay)
+    agent = MatchThreeAgent(
+        top_left,
+        bottom_right,
+        elem_images,
+        action_delay=action_delay,
+        auto_recalibrate=auto_recalibrate,
+        recalibrate_interval=recalibrate_interval
+    )
+    perf_tracker = PerfTracker(enabled=perf, summary_every=perf_every)
+    agent.set_perf_tracker(perf_tracker)
     last_board_signature = None
     last_action = None
 
-    while True:
-        should_stop, last_board_signature, last_action = run_main_cycle(
-            agent=agent,
-            wait_static=wait_static,
-            lookahead_depth=lookahead_depth,
-            disable_wait_settle=disable_wait_settle,
-            settle_timeout=settle_timeout,
-            last_board_signature=last_board_signature,
-            last_action=last_action
-        )
-        if should_stop:
-            break
+    try:
+        while True:
+            should_stop, last_board_signature, last_action = run_main_cycle(
+                agent=agent,
+                wait_static=wait_static,
+                lookahead_depth=lookahead_depth,
+                disable_wait_settle=disable_wait_settle,
+                settle_timeout=settle_timeout,
+                last_board_signature=last_board_signature,
+                last_action=last_action,
+                perf_tracker=perf_tracker
+            )
+            if should_stop:
+                break
+    finally:
+        perf_tracker.print_summary()
 
 
 def build_arg_parser():
@@ -1004,6 +1416,14 @@ def build_arg_parser():
                           help='disable waiting for board to settle after each swap')
     advanced.add_argument('--settle_timeout', type=float, default=DEFAULT_SETTLE_TIMEOUT,
                           help=f'max seconds to wait for board settling after each swap (default: {DEFAULT_SETTLE_TIMEOUT})')
+    advanced.add_argument('--disable_auto_recalibrate', action="store_true",
+                          help='disable auto recalibration based on board recognition feedback')
+    advanced.add_argument('--recalibrate_interval', type=int, default=DEFAULT_RECALIBRATE_INTERVAL,
+                          help=f'run auto recalibration every N cycles (default: {DEFAULT_RECALIBRATE_INTERVAL})')
+    advanced.add_argument('--perf', action="store_true",
+                          help='enable per-step runtime profiling and periodic summary logs')
+    advanced.add_argument('--perf_every', type=int, default=DEFAULT_PERF_SUMMARY_EVERY,
+                          help=f'print perf summary every N cycles (default: {DEFAULT_PERF_SUMMARY_EVERY})')
     return parser
 
 
@@ -1023,9 +1443,21 @@ if __name__ == "__main__":
             action_delay=max(0.0, args.action_delay),
             lookahead_depth=min(DEFAULT_LOOKAHEAD_DEPTH, max(1, args.lookahead_depth)),
             disable_wait_settle=args.disable_wait_settle,
-            settle_timeout=max(0.3, args.settle_timeout)
+            settle_timeout=max(0.3, args.settle_timeout),
+            perf=args.perf,
+            perf_every=max(1, args.perf_every),
+            auto_recalibrate=(not args.disable_auto_recalibrate),
+            recalibrate_interval=max(1, args.recalibrate_interval)
         )
+    except KeyboardInterrupt:
+        stop_agent = True
+        print("KeyboardInterrupt received, exiting...")
     except Exception as e:
         print('An error occurred: {}'.format(e))
         time.sleep(5)
         raise
+    finally:
+        try:
+            listener.stop()
+        except Exception:
+            pass
