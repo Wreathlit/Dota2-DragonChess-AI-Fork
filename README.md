@@ -13,23 +13,39 @@ It will help you beat the game.
 2. Run `run_agent.exe` run as administrator.
 3. Move the mouse over `Play` on game page, then press `b` to start.
 4. Watch it play.
-5. Use `q` to pause/unpause the program, use `esc` to exit the program.
+5. Use `p` (or `q`, for compatibility) to pause/unpause the program, use `esc` to exit the program.
+6. The agent will automatically detect the Dota2 window and calibrate board position.
 
 
 
 ### Supported Arguments
 `--wait_static` or `-w`, if set, it will wait for a static board to perform the next action.
 
-`--show` or `-s`, if set, it will display the identified game board image, use this for debugging.
+`--show` or `--show_board` or `-s`, if set, it will display the identified game board image, use this for debugging.
 
-`--board_coordinates` or `-b`,
-Specify the coordinates of the game board manually in the format x1,y1,x2,y2 where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner of the square game board. This is useful if the program has trouble automatically identifying the game board.
-```
-# Run the following command from a terminal:
-path/to/run_agent.exe -b 185 195 1260 1270
-```
+`--action_delay`,
+Delay after each swap action in seconds. Increase this if pieces have not fully settled before the next move. Default: `0.5`.
+
+`--lookahead_depth`,
+Search depth for move planning. Recommended `3~4`. Default: `3`.
+
+`--disable_wait_settle`,
+Disable waiting for board settling after each swap.
+
+`--settle_timeout`,
+Maximum seconds to wait for board settling after each swap. Default: `2.0`.
+
 You can take a screenshot and paste it to Windows paint to find out the coordinates (as shown below). 
 ![board_example.png](board_example.png)
+
+### Install Dependencies (Python)
+```bash
+python -m venv .venv
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
 
 ### Q&A
@@ -40,7 +56,8 @@ You can take a screenshot and paste it to Windows paint to find out the coordina
 * The mouse is not clicking within the area of the board or not switching the right element.
 * The program raises an error and exits.
 
-These problems occur when the game board is not correctly identified. Try changing game resolution or use `--board_coordinates` above to manually set up board coordinates.
+These problems occur when the game board is not correctly identified. Try changing game resolution and make sure the Dota2 game window is visible on screen.
+These problems occur when the game board is not correctly identified. Try changing game resolution and make sure the Dota2 game window is visible on screen.
 
 2. Will it get you VAC banned?
 
