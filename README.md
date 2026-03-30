@@ -40,7 +40,7 @@ Maximum seconds to wait for board settling after each swap. Default: `1.6`.
 Disable the default-on automatic board recalibration (secondary calibration based on recognition quality).
 
 `--recalibrate_interval`,
-Run automatic recalibration every N cycles. Default: `15`.
+Run automatic recalibration every N cycles. Default: `30`.
 
 `--perf`,
 Enable per-step runtime profiling and periodic summary output.

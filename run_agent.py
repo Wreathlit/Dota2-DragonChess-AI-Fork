@@ -3,6 +3,7 @@ import sys
 import random
 import time
 import ctypes
+import zlib
 from ctypes import wintypes
 from collections import defaultdict
 import argparse
@@ -10,6 +11,11 @@ import cv2
 import numpy as np
 import pyautogui
 from pynput.keyboard import Listener, Key
+
+try:
+    import mss
+except ImportError:
+    mss = None
 
 
 start_agent = False
@@ -22,15 +28,29 @@ DEFAULT_ACTION_DELAY = 0.5
 DEFAULT_LOOKAHEAD_DEPTH = 3
 DEFAULT_SETTLE_TIMEOUT = 1.6
 DEFAULT_PERF_SUMMARY_EVERY = 10
+DEFAULT_IDLE_POLL_INTERVAL = 0.3
 DEFAULT_SETTLE_POLL_INTERVAL = 0.035
 DEFAULT_SETTLE_STABLE_FRAMES = 3
 DEFAULT_SETTLE_DIFF_THRESHOLD = 2.4
 DEFAULT_SETTLE_DOWNSCALE = 56
 DEFAULT_AUTO_RECALIBRATE = True
-DEFAULT_RECALIBRATE_INTERVAL = 15
+DEFAULT_RECALIBRATE_INTERVAL = 30
 DEFAULT_RECALIBRATE_PADDING = 14
 DEFAULT_RECALIBRATE_STEP = 4
 DEFAULT_RECALIBRATE_BAD_SCORE = 0.43
+DEFAULT_RECALIBRATE_PERIODIC_SCORE = 0.395
+DEFAULT_RECALIBRATE_INEFFECTIVE_STREAK = 2
+DEFAULT_RECALIBRATE_COOLDOWN_CYCLES = 10
+DEFAULT_RECOGNITION_RETRY_SAMPLES = 3
+DEFAULT_RECOGNITION_RETRY_INTERVAL = 0.06
+DEFAULT_CONFIDENCE_PAUSE_THRESHOLD = 0.50
+DEFAULT_CONFIDENCE_PAUSE_STREAK = 2
+DEFAULT_CONFIDENCE_RESUME_THRESHOLD = 0.44
+DEFAULT_CONFIDENCE_RESUME_STREAK = 2
+DEFAULT_FAILED_ACTION_COOLDOWN = 0.35
+DEFAULT_DRAG_HOLD_BEFORE_MOVE = 0.020
+DEFAULT_DRAG_HOLD_AFTER_MOVE = 0.045
+DEFAULT_DRAG_HOLD_AFTER_MOVE_RETRY = 0.065
 HSV_SAT_THRESHOLD = 35
 HSV_VAL_THRESHOLD = 30
 MORPH_KERNEL_SIZE = 3
@@ -42,6 +62,8 @@ SAT_WEIGHT = 0.30
 SHAPE_WEIGHT = 0.15
 EDGE_WEIGHT = 0.20
 STANDARD_OBJECT_RATIO = 0.68
+_MSS_CTX = None
+_BOARD_TEMPLATE_CACHE = {}
 
 
 class PerfTracker:
@@ -106,7 +128,35 @@ def get_image_array(image):
     return image_array
 
 
+def _capture_with_mss(region=None):
+    global _MSS_CTX
+    if mss is None:
+        return None
+    if _MSS_CTX is None:
+        _MSS_CTX = mss.mss()
+
+    if region is None:
+        monitor = _MSS_CTX.monitors[0]
+    else:
+        left, top, width, height = normalize_region(region)
+        monitor = {"left": int(left), "top": int(top), "width": int(width), "height": int(height)}
+
+    frame = np.asarray(_MSS_CTX.grab(monitor), dtype=np.uint8)
+    if frame.ndim != 3 or frame.shape[2] < 3:
+        return None
+    return frame[:, :, :3]
+
+
 def capture_screen_array(region=None):
+    region = normalize_region(region)
+    frame = None
+    try:
+        frame = _capture_with_mss(region=region)
+    except Exception:
+        frame = None
+    if frame is not None:
+        return frame
+
     # pyautogui expects region=(left, top, width, height)
     screenshot = pyautogui.screenshot(region=region)
     return get_image_array(screenshot)
@@ -180,9 +230,7 @@ def normalize_region(region):
     return x, y, width, height
 
 
-def _match_template_multiscale(search_image, target_image, confidence=0.72, scale_min=0.55, scale_max=1.45, scale_steps=19):
-    search_gray = cv2.cvtColor(search_image, cv2.COLOR_BGR2GRAY)
-    search_edge = cv2.Canny(search_gray, 40, 120)
+def _match_template_multiscale(search_gray, search_edge, target_image, confidence=0.72, scale_min=0.55, scale_max=1.45, scale_steps=19):
     target_gray = cv2.cvtColor(target_image, cv2.COLOR_BGR2GRAY)
 
     best = None
@@ -210,6 +258,18 @@ def _match_template_multiscale(search_image, target_image, confidence=0.72, scal
     return None
 
 
+def _load_board_templates(resource_dir):
+    key = os.path.abspath(resource_dir)
+    cached = _BOARD_TEMPLATE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    top_left_template = cv2.imread(os.path.join(resource_dir, 'topLeft.jpg'), cv2.IMREAD_COLOR)
+    bottom_right_template = cv2.imread(os.path.join(resource_dir, 'botRight.jpg'), cv2.IMREAD_COLOR)
+    _BOARD_TEMPLATE_CACHE[key] = (top_left_template, bottom_right_template)
+    return top_left_template, bottom_right_template
+
+
 def load_elem_images(directory):
     elem_images = {}
     for filename in os.listdir(directory):
@@ -231,13 +291,14 @@ def find_game_board(resource_dir, search_region=None, confidence=0.72):
     image_array = capture_screen_array(region=search_region)
     origin_x, origin_y = (search_region[0], search_region[1]) if search_region else (0, 0)
 
-    top_left_template = cv2.imread(os.path.join(resource_dir, 'topLeft.jpg'), cv2.IMREAD_COLOR)
-    bottom_right_template = cv2.imread(os.path.join(resource_dir, 'botRight.jpg'), cv2.IMREAD_COLOR)
+    top_left_template, bottom_right_template = _load_board_templates(resource_dir)
     if top_left_template is None or bottom_right_template is None:
         return None, None
 
-    top_left_loc = _match_template_multiscale(image_array, top_left_template, confidence=confidence)
-    bottom_right_loc = _match_template_multiscale(image_array, bottom_right_template, confidence=confidence)
+    search_gray = cv2.cvtColor(image_array, cv2.COLOR_BGR2GRAY)
+    search_edge = cv2.Canny(search_gray, 40, 120)
+    top_left_loc = _match_template_multiscale(search_gray, search_edge, top_left_template, confidence=confidence)
+    bottom_right_loc = _match_template_multiscale(search_gray, search_edge, bottom_right_template, confidence=confidence)
 
     # Return None when board corner not found
     if top_left_loc is None or bottom_right_loc is None:
@@ -338,14 +399,30 @@ def execute_action_cycle(agent, action, disable_wait_settle, settle_timeout, per
     if perf_tracker is not None:
         perf_tracker.add("take_action", time.perf_counter() - t_take)
 
+    settled = True
     if action and not disable_wait_settle:
         t_wait = time.perf_counter()
         settled = agent.wait_until_board_settled(timeout=settle_timeout)
         if perf_tracker is not None:
             perf_tracker.add("wait_board_settle", time.perf_counter() - t_wait)
         if not settled:
-            print("Board settle wait timeout; continue with next cycle.")
-    return action
+            print("Board settle wait timeout; retry swap with conservative gesture.")
+            t_retry = time.perf_counter()
+            retried = agent.retry_action(action)
+            if perf_tracker is not None:
+                perf_tracker.add("retry_take_action", time.perf_counter() - t_retry)
+
+            if retried:
+                t_wait_retry = time.perf_counter()
+                settled = agent.wait_until_board_settled(timeout=max(0.4, settle_timeout * 0.75))
+                if perf_tracker is not None:
+                    perf_tracker.add("wait_board_settle_retry", time.perf_counter() - t_wait_retry)
+
+            if not settled:
+                print("Retry also failed to settle; continue with next cycle.")
+                # Avoid back-to-back failed swaps when the board is still in transition.
+                time.sleep(DEFAULT_FAILED_ACTION_COOLDOWN)
+    return action, settled
 
 
 def print_cycle_log(elem_array, elem_sub_array, action, confidence_score, elapsed_sec):
@@ -373,14 +450,15 @@ def wait_for_start_signal():
 
 
 def run_main_cycle(agent, wait_static, lookahead_depth, disable_wait_settle, settle_timeout,
-                   last_board_signature, last_action, perf_tracker=None):
+                   last_board_signature, last_action, perf_tracker=None,
+                   idle_poll_interval=DEFAULT_IDLE_POLL_INTERVAL):
     if stop_agent:
         print("Program stopped by user.")
         return True, last_board_signature, last_action
 
     if pause_agent:
         print("Program paused by user. Press 'p' or 'q' again to unpause.")
-        time.sleep(1)
+        time.sleep(max(0.05, float(idle_poll_interval)))
         return False, last_board_signature, last_action
 
     t_cycle = time.perf_counter()
@@ -400,11 +478,24 @@ def run_main_cycle(agent, wait_static, lookahead_depth, disable_wait_settle, set
             avg_confidence_score = agent.refresh_board_state()
             if perf_tracker is not None:
                 perf_tracker.add("refresh_after_recalibrate", time.perf_counter() - t_refresh)
+
+    if agent.should_pause_for_high_deviation(avg_confidence_score):
+        print(
+            f"Recognition deviation too high ({avg_confidence_score:.4f}), "
+            "treat as paused and skip this cycle."
+        )
+        if perf_tracker is not None:
+            perf_tracker.add("cycle_total", time.perf_counter() - t_cycle)
+            perf_tracker.mark_cycle(action_taken=False, skipped=True)
+        time.sleep(max(0.05, float(idle_poll_interval)))
+        return False, last_board_signature, last_action
+
     should_act = agent.should_take_action(wait_static)
     if not should_act:
         if perf_tracker is not None:
             perf_tracker.add("cycle_total", time.perf_counter() - t_cycle)
             perf_tracker.mark_cycle(action_taken=False, skipped=True)
+        time.sleep(max(0.05, float(idle_poll_interval)))
         return False, last_board_signature, last_action
 
     t_actions = time.perf_counter()
@@ -412,7 +503,12 @@ def run_main_cycle(agent, wait_static, lookahead_depth, disable_wait_settle, set
     if perf_tracker is not None:
         perf_tracker.add("get_action_candidates", time.perf_counter() - t_actions)
 
-    board_signature = agent.elem_array.tobytes() + agent.elem_sub_array.tobytes()
+    board_signature = agent.get_board_signature()
+    if last_action is not None and board_signature == last_board_signature:
+        agent._ineffective_streak += 1
+    else:
+        agent._ineffective_streak = 0
+
     t_choose = time.perf_counter()
     action, should_skip = choose_action_with_repeat_guard(
         agent=agent,
@@ -426,19 +522,31 @@ def run_main_cycle(agent, wait_static, lookahead_depth, disable_wait_settle, set
         perf_tracker.add("choose_best_action", time.perf_counter() - t_choose)
 
     if should_skip:
-        time.sleep(0.08)
+        # Force fresh recognition to avoid stale/repeated retries on unchanged signatures.
+        t_resync = time.perf_counter()
+        agent.force_resync_board_state()
+        if perf_tracker is not None:
+            perf_tracker.add("force_resync", time.perf_counter() - t_resync)
+        time.sleep(max(0.05, float(idle_poll_interval)))
         if perf_tracker is not None:
             perf_tracker.add("cycle_total", time.perf_counter() - t_cycle)
             perf_tracker.mark_cycle(action_taken=False, skipped=True)
         return False, last_board_signature, last_action
 
-    action = execute_action_cycle(
+    action, settled = execute_action_cycle(
         agent=agent,
         action=action,
         disable_wait_settle=disable_wait_settle,
         settle_timeout=settle_timeout,
         perf_tracker=perf_tracker
     )
+    if action and not settled:
+        # If action likely failed or board is still unstable, force multi-sample refresh.
+        t_resync = time.perf_counter()
+        agent.force_resync_board_state()
+        if perf_tracker is not None:
+            perf_tracker.add("force_resync", time.perf_counter() - t_resync)
+
     if perf_tracker is not None:
         perf_tracker.add("cycle_total", time.perf_counter() - t_cycle)
         perf_tracker.mark_cycle(action_taken=bool(action), skipped=False)
@@ -490,6 +598,37 @@ class ElementMatcher:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         return crop, mask
 
+    def _extract_grid_features_once(self, image):
+        crop, mask = self._extract_piece_mask(image)
+        if crop is None or mask is None:
+            return None, None, None, None
+
+        non_zero = cv2.countNonZero(mask)
+        if non_zero < 10:
+            return None, None, None, None
+
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+        hist = cv2.calcHist([hsv], [0], mask, [HUE_HIST_BINS], [0, 180])
+        if hist is not None:
+            cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+
+        sat_hist = cv2.calcHist([hsv], [1], mask, [SAT_HIST_BINS], [0, 256])
+        if sat_hist is not None:
+            cv2.normalize(sat_hist, sat_hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour = None
+        if contours:
+            cand = max(contours, key=cv2.contourArea)
+            if float(cv2.contourArea(cand)) >= MIN_CONTOUR_AREA:
+                contour = cand
+
+        gray = cv2.bitwise_and(gray, gray, mask=mask)
+        edge = cv2.Canny(gray, 50, 140)
+        return hist, sat_hist, contour, edge
+
     def _standardize_by_contour(self, image, target_width, target_height):
         """
         Normalize piece scale/position using the largest contour:
@@ -529,60 +668,19 @@ class ElementMatcher:
         return canvas
 
     def _extract_main_contour(self, image):
-        crop, mask = self._extract_piece_mask(image)
-        if crop is None or mask is None:
-            return None
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-
-        contour = max(contours, key=cv2.contourArea)
-        area = float(cv2.contourArea(contour))
-        if area < MIN_CONTOUR_AREA:
-            return None
+        _, _, contour, _ = self._extract_grid_features_once(image)
         return contour
 
     def _extract_hue_hist(self, image):
-        crop, mask = self._extract_piece_mask(image)
-        if crop is None or mask is None:
-            return None
-
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        if cv2.countNonZero(mask) < 10:
-            return None
-
-        hist = cv2.calcHist([hsv], [0], mask, [HUE_HIST_BINS], [0, 180])
-        if hist is None:
-            return None
-        cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+        hist, _, _, _ = self._extract_grid_features_once(image)
         return hist
 
     def _extract_sat_hist(self, image):
-        crop, mask = self._extract_piece_mask(image)
-        if crop is None or mask is None:
-            return None
-
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        if cv2.countNonZero(mask) < 10:
-            return None
-
-        hist = cv2.calcHist([hsv], [1], mask, [SAT_HIST_BINS], [0, 256])
-        if hist is None:
-            return None
-        cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
-        return hist
+        _, sat_hist, _, _ = self._extract_grid_features_once(image)
+        return sat_hist
 
     def _extract_edge_map(self, image):
-        crop, mask = self._extract_piece_mask(image)
-        if crop is None or mask is None:
-            return None
-
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        gray = cv2.bitwise_and(gray, gray, mask=mask)
-        edge = cv2.Canny(gray, 50, 140)
-        if edge is None:
-            return None
+        _, _, _, edge = self._extract_grid_features_once(image)
         return edge
 
     def set_grid_size(self, width, height):
@@ -686,10 +784,7 @@ class ElementMatcher:
 
         for i, grid in enumerate(grids):
             # Keep runtime grid in native appearance; only templates are standardized.
-            grid_hist = self._extract_hue_hist(grid)
-            grid_sat_hist = self._extract_sat_hist(grid)
-            contour = self._extract_main_contour(grid)
-            grid_edge = self._extract_edge_map(grid)
+            grid_hist, grid_sat_hist, contour, grid_edge = self._extract_grid_features_once(grid)
             if grid_hist is None and grid_sat_hist is None and contour is None:
                 labels[i] = 0
                 subclass_labels[i] = 0
@@ -733,9 +828,14 @@ class MatchThreeAgent:
     ROW_NUM = 8
     COL_NUM = 8
 
-    def __init__(self, top_left, bottom_right, elem_images, action_delay=0.5,
+    def __init__(self, top_left, bottom_right, elem_images, action_delay=DEFAULT_ACTION_DELAY,
                  auto_recalibrate=DEFAULT_AUTO_RECALIBRATE,
-                 recalibrate_interval=DEFAULT_RECALIBRATE_INTERVAL):
+                 recalibrate_interval=DEFAULT_RECALIBRATE_INTERVAL,
+                 confidence_pause_threshold=DEFAULT_CONFIDENCE_PAUSE_THRESHOLD,
+                 confidence_pause_streak=DEFAULT_CONFIDENCE_PAUSE_STREAK,
+                 confidence_resume_threshold=DEFAULT_CONFIDENCE_RESUME_THRESHOLD,
+                 confidence_resume_streak=DEFAULT_CONFIDENCE_RESUME_STREAK,
+                 recalibrate_cooldown_cycles=DEFAULT_RECALIBRATE_COOLDOWN_CYCLES):
         self.prev_elem_array = None
         self.elem_array = np.zeros((8, 8), dtype=np.int64)
         self.elem_sub_array = np.zeros((8, 8), dtype=np.int64)
@@ -756,7 +856,22 @@ class MatchThreeAgent:
         self._auto_recalibrate = bool(auto_recalibrate)
         self._recalibrate_interval = max(1, int(recalibrate_interval))
         self._cycle_index = 0
+        self._ineffective_streak = 0
         self._perf_tracker = None
+        self._sim_cache_max = 12000
+        self._sim_cache = {}
+        self._confidence_pause_threshold = float(confidence_pause_threshold)
+        self._confidence_pause_streak = max(1, int(confidence_pause_streak))
+        self._confidence_resume_threshold = min(
+            self._confidence_pause_threshold,
+            float(confidence_resume_threshold)
+        )
+        self._confidence_resume_streak = max(1, int(confidence_resume_streak))
+        self._high_deviation_streak = 0
+        self._low_deviation_streak = 0
+        self._deviation_paused = False
+        self._recalibrate_cooldown_cycles = max(1, int(recalibrate_cooldown_cycles))
+        self._last_recalibrate_cycle = -10**9
         # self._elem_images = elem_images
         self._element_matcher = ElementMatcher(elem_images)
 
@@ -765,9 +880,46 @@ class MatchThreeAgent:
 
     def identify_game_board(self):
         x, y, w, h = self._top_left[0], self._top_left[1], self._bottom_right[0], self._bottom_right[1]
-        board = pyautogui.screenshot(region=(x, y, w - x, h - y))
-        board_array = get_image_array(board)
-        return board_array
+        return capture_screen_array(region=(x, y, w - x, h - y))
+
+    def get_board_signature(self):
+        sig = zlib.crc32(np.ascontiguousarray(self.elem_array).view(np.uint8))
+        sig = zlib.crc32(np.ascontiguousarray(self.elem_sub_array).view(np.uint8), sig)
+        return int(sig)
+
+    @staticmethod
+    def _line_has_triplet(line):
+        run_len = 1
+        prev = int(line[0])
+        for value in line[1:]:
+            cur = int(value)
+            if cur != 0 and cur == prev:
+                run_len += 1
+                if run_len >= 3:
+                    return True
+            else:
+                run_len = 1
+                prev = cur
+        return False
+
+    def _has_match_after_swap_local(self, board, index1, index2):
+        r1, c1 = index1
+        r2, c2 = index2
+        board[index1], board[index2] = board[index2], board[index1]
+
+        has_match = False
+        for row in (r1, r2):
+            if self._line_has_triplet(board[row, :]):
+                has_match = True
+                break
+        if not has_match:
+            for col in (c1, c2):
+                if self._line_has_triplet(board[:, col]):
+                    has_match = True
+                    break
+
+        board[index1], board[index2] = board[index2], board[index1]
+        return has_match
 
     def _update_grid_locations(self):
         if self._x_edges is None or self._y_edges is None:
@@ -805,12 +957,49 @@ class MatchThreeAgent:
             self._perf_tracker.add("wait_static_gate", time.perf_counter() - t_gate)
         return should_act
 
+    def should_pause_for_high_deviation(self, avg_confidence_score):
+        score = float(avg_confidence_score)
+
+        if self._deviation_paused:
+            if score <= self._confidence_resume_threshold:
+                self._low_deviation_streak += 1
+            else:
+                self._low_deviation_streak = 0
+            if self._low_deviation_streak >= self._confidence_resume_streak:
+                self._deviation_paused = False
+                self._high_deviation_streak = 0
+                self._low_deviation_streak = 0
+                return False
+            return True
+
+        if score >= self._confidence_pause_threshold:
+            self._high_deviation_streak += 1
+        else:
+            self._high_deviation_streak = 0
+        if self._high_deviation_streak >= self._confidence_pause_streak:
+            self._deviation_paused = True
+            self._low_deviation_streak = 0
+            return True
+        return False
+
     def should_attempt_recalibrate(self, avg_confidence_score):
         if not self._auto_recalibrate:
             return False
-        if self._cycle_index % self._recalibrate_interval == 0:
+        if (self._cycle_index - self._last_recalibrate_cycle) < self._recalibrate_cooldown_cycles:
+            return False
+        score = float(avg_confidence_score)
+        should_recalibrate = False
+        if score >= DEFAULT_RECALIBRATE_BAD_SCORE:
+            should_recalibrate = True
+        elif self._ineffective_streak >= DEFAULT_RECALIBRATE_INEFFECTIVE_STREAK:
+            should_recalibrate = True
+        elif self._cycle_index % self._recalibrate_interval == 0 and score >= DEFAULT_RECALIBRATE_PERIODIC_SCORE:
+            should_recalibrate = True
+
+        if should_recalibrate:
+            self._last_recalibrate_cycle = self._cycle_index
             return True
-        return float(avg_confidence_score) >= DEFAULT_RECALIBRATE_BAD_SCORE
+        return False
 
     def _split_board_into_grids_local(self, board_array):
         h, w, _ = board_array.shape
@@ -993,6 +1182,37 @@ class MatchThreeAgent:
         self.elem_array = elem_array
         self.elem_sub_array = elem_sub_array
 
+    def force_resync_board_state(self, samples=DEFAULT_RECOGNITION_RETRY_SAMPLES, interval=DEFAULT_RECOGNITION_RETRY_INTERVAL):
+        best = None
+        for i in range(max(1, int(samples))):
+            board_array = self.identify_game_board()
+            grids = self.split_board_into_grids(board_array)
+            labels, subclass_labels, scores = self._element_matcher.classify_grids(grids)
+
+            elem_array = np.zeros((8, 8), dtype=np.int64)
+            elem_sub_array = np.zeros((8, 8), dtype=np.int64)
+            score_list = []
+            for k, (label, subclass_label, score) in enumerate(zip(labels, subclass_labels, scores)):
+                row, col = k // 8, k % 8
+                elem_array[row, col] = int(label) + 1
+                elem_sub_array[row, col] = int(subclass_label)
+                score_list.append(float(score))
+
+            avg_score = float(np.mean(score_list)) if score_list else 1.0
+            if best is None or avg_score < best[0]:
+                best = (avg_score, elem_array, elem_sub_array, score_list)
+
+            if i + 1 < samples:
+                time.sleep(max(0.0, float(interval)))
+
+        if best is not None:
+            _, elem_array, elem_sub_array, score_list = best
+            self.prev_elem_array = None
+            self.elem_array = elem_array
+            self.elem_sub_array = elem_sub_array
+            self._scores = score_list
+        return self.get_confidence_score()
+
     def get_grid_element(self, index):
         if 0 <= index[0] < self.ROW_NUM and 0 <= index[1] < self.COL_NUM:
             return self.elem_array[index]
@@ -1011,6 +1231,18 @@ class MatchThreeAgent:
         def index_could_swap(index):
             return index in cur_grid_lst and ar_swap[index]
 
+        def normalized_pair(index1, index2):
+            a = (int(index1[0]), int(index1[1]))
+            b = (int(index2[0]), int(index2[1]))
+            return (a, b) if a <= b else (b, a)
+
+        def add_action(index1, index2):
+            action = ((int(index1[0]), int(index1[1])), (int(index2[0]), int(index2[1])))
+            key = normalized_pair(action[0], action[1])
+            if key not in action_map:
+                # Keep first-discovered direction to avoid random reversal from set ordering.
+                action_map[key] = action
+
         cur_grid_lst = [(i, j) for i in range(0, self.ROW_NUM) for j in range(0, self.COL_NUM)]
         ar_swap = np.zeros((self.ROW_NUM, self.COL_NUM))
         ar_match = np.zeros((self.ROW_NUM, self.COL_NUM))
@@ -1018,39 +1250,39 @@ class MatchThreeAgent:
             ar_swap[index] = self.elem_array[index]
             ar_match[index] = self.elem_array[index]
 
-        action_set = set()
+        action_map = {}
         for i, j in np.argwhere(np.logical_and(ar_match[:, :-1] == ar_match[:, 1:], ar_match[:, :-1] != 0)):
             if index_could_swap((i, j - 1)):
                 for index in [(i - 1, j - 1), (i + 1, j - 1), (i, j - 2)]:
                     if index_could_swap(index) and equal_match_value((i, j), index):
-                        action_set.add(((i, j - 1), index))
+                        add_action((i, j - 1), index)
             if index_could_swap((i, j + 2)):
                 for index in [(i - 1, j + 2), (i + 1, j + 2), (i, j + 3)]:
                     if index_could_swap(index) and equal_match_value((i, j), index):
-                        action_set.add(((i, j + 2), index))
+                        add_action((i, j + 2), index)
         for i, j in np.argwhere(np.logical_and(ar_match[:-1, :] == ar_match[1:, :], ar_match[:-1, :] != 0)):
             if index_could_swap((i - 1, j)):
                 for index in [(i - 1, j - 1), (i - 1, j + 1), (i - 2, j)]:
                     if index_could_swap(index) and equal_match_value((i, j), index):
-                        action_set.add(((i - 1, j), index))
+                        add_action((i - 1, j), index)
             if index_could_swap((i + 2, j)):
                 for index in [(i + 2, j - 1), (i + 2, j + 1), (i + 3, j)]:
                     if index_could_swap(index) and equal_match_value((i, j), index):
-                        action_set.add(((i + 2, j), index))
+                        add_action((i + 2, j), index)
         for i, j in np.argwhere(np.logical_and(ar_match[:, :-2] == ar_match[:, 2:], ar_match[:, :-2] != 0)):
             if index_could_swap((i, j + 1)):
                 for index in [(i - 1, j + 1), (i + 1, j + 1)]:
                     if equal_match_value((i, j), index):
                         if index_could_swap(index):
-                            action_set.add(((i, index[1]), index))
+                            add_action((i, index[1]), index)
         for i, j in np.argwhere(np.logical_and(ar_match[:-2, :] == ar_match[2:, :], ar_match[:-2, :] != 0)):
             if index_could_swap((i + 1, j)):
                 for index in [(i + 1, j - 1), (i + 1, j + 1)]:
                     if equal_match_value((i, j), index):
                         if index_could_swap(index):
-                            action_set.add(((index[0], j), index))
+                            add_action((index[0], j), index)
 
-        return list(action_set)
+        return list(action_map.values())
 
     def _find_matches(self, board):
         horizontal_groups = []
@@ -1154,6 +1386,131 @@ class MatchThreeAgent:
             return 1
         return 0
 
+    @staticmethod
+    def _advanced_piece_tier(sub_code):
+        sub_code = int(sub_code)
+        variant = sub_code % 10
+        if sub_code == 43:
+            return 5
+        if sub_code == 63:
+            return 4
+        if sub_code == 22:
+            return 3
+        if variant == 3:
+            return 2
+        if variant == 2:
+            return 1
+        return 0
+
+    @staticmethod
+    def _advanced_piece_score(sub_code):
+        tier = MatchThreeAgent._advanced_piece_tier(sub_code)
+        if tier == 5:
+            return 1200
+        if tier == 4:
+            return 950
+        if tier == 3:
+            return 780
+        if tier == 2:
+            return 460
+        if tier == 1:
+            return 260
+        return 0
+
+    @staticmethod
+    def _advanced_competitive_rank(tier):
+        # Only top-2 advanced tiers keep strict global priority.
+        # Tier-3+ joins normal match-pattern competition.
+        if tier >= 4:
+            return 0
+        if tier == 3:
+            # 2_2 competes around 4-line level.
+            return 2
+        if tier == 2:
+            # other x_3 competes around 3-line/4-line boundary (weaker than tier-3).
+            return 1
+        if tier == 1:
+            # other x_2 has mild tactical preference.
+            return 1
+        return 0
+
+    @staticmethod
+    def _predict_generated_sub_code(simulated_board, match_type, create_pos):
+        if create_pos is None:
+            return 0
+        if match_type in ("cross_3_3", "line_5"):
+            variant = 3
+        elif match_type == "line_4_h":
+            variant = 2
+        else:
+            return 0
+
+        r, c = int(create_pos[0]), int(create_pos[1])
+        if r < 0 or c < 0 or r >= simulated_board.shape[0] or c >= simulated_board.shape[1]:
+            return 0
+        piece_type = int(simulated_board[r, c])
+        if piece_type <= 0:
+            return 0
+        return piece_type * 10 + variant
+
+    def _action_priority_key(self, board, sub_board, action):
+        simulated = board.copy()
+        index1, index2 = action
+        simulated[index1], simulated[index2] = simulated[index2], simulated[index1]
+        match_info = self._find_matches(simulated)
+        matched_cells = match_info["matched_cells"]
+        if not matched_cells:
+            return (-1, -1, -1, -1, -1.0, -1)
+
+        # 1) Advanced-piece elimination priority.
+        best_advanced_tier = 0
+        advanced_score = 0
+        for row, col in matched_cells:
+            sub_code = int(sub_board[row, col]) if sub_board is not None else 0
+            best_advanced_tier = max(best_advanced_tier, self._advanced_piece_tier(sub_code))
+            advanced_score += self._advanced_piece_score(sub_code)
+
+        # 2) Match pattern priority (5/cross > 4_h > 3).
+        match_type, create_pos = self._classify_match_priority(match_info)
+        match_rank = self._priority_rank(match_type)
+
+        # Only top-2 advanced tiers (4_3 / 6_3) are strict global priority.
+        elite_advanced_rank = best_advanced_tier if best_advanced_tier >= 4 else 0
+        competitive_advanced_rank = self._advanced_competitive_rank(best_advanced_tier)
+        competitive_rank = max(match_rank, competitive_advanced_rank)
+
+        # Special-piece generation preference under same 5/4 level.
+        generated_sub_code = self._predict_generated_sub_code(simulated, match_type, create_pos)
+        generated_tier = self._advanced_piece_tier(generated_sub_code)
+        generated_score = self._advanced_piece_score(generated_sub_code)
+
+        # 3) Direction preference: vertical > horizontal (for same higher-level conditions).
+        has_vertical = any(len(g) >= 3 for g in match_info["vertical_groups"])
+        has_horizontal = any(len(g) >= 3 for g in match_info["horizontal_groups"])
+        if has_vertical and not has_horizontal:
+            direction_rank = 2
+        elif has_vertical:
+            direction_rank = 1
+        else:
+            direction_rank = 0
+
+        # 4) Lower-board preference.
+        bottom_rank = float(sum(r for r, _ in matched_cells)) / max(1, len(matched_cells))
+        largest_row = max(r for r, _ in matched_cells)
+
+        return (
+            elite_advanced_rank,
+            competitive_rank,
+            match_rank,
+            generated_tier,
+            generated_score,
+            advanced_score,
+            competitive_advanced_rank,
+            direction_rank,
+            bottom_rank,
+            largest_row
+        )
+
     def _apply_gravity_and_fill(self, board, rng, fill_values):
         new_board = board.copy()
         for col in range(self.COL_NUM):
@@ -1166,6 +1523,14 @@ class MatchThreeAgent:
         return new_board
 
     def _simulate_action(self, board, action, depth):
+        cache_key = None
+        if self._sim_cache is not None:
+            cache_key = (board.tobytes(), action, int(depth))
+            cached = self._sim_cache.get(cache_key)
+            if cached is not None:
+                cached_score, cached_board = cached
+                return cached_score, (None if cached_board is None else cached_board.copy())
+
         index1, index2 = action
         if index1 == index2:
             return -10**9, None
@@ -1209,6 +1574,10 @@ class MatchThreeAgent:
             if chain >= 8:
                 break
 
+        if cache_key is not None:
+            if len(self._sim_cache) >= self._sim_cache_max:
+                self._sim_cache.clear()
+            self._sim_cache[cache_key] = (score, simulated.copy())
         return score, simulated
 
     def _generate_valid_swap_actions(self, board):
@@ -1218,9 +1587,7 @@ class MatchThreeAgent:
                 for ni, nj in ((i + 1, j), (i, j + 1)):
                     if ni >= self.ROW_NUM or nj >= self.COL_NUM:
                         continue
-                    swapped = board.copy()
-                    swapped[(i, j)], swapped[(ni, nj)] = swapped[(ni, nj)], swapped[(i, j)]
-                    if self._find_matches(swapped)["matched_cells"]:
+                    if self._has_match_after_swap_local(board, (i, j), (ni, nj)):
                         actions.append(((i, j), (ni, nj)))
         return actions
 
@@ -1236,13 +1603,18 @@ class MatchThreeAgent:
         ) & 0xffffffff
 
         rollout_sum = 0.0
+        valid_action_cache = {}
         for sample_idx in range(self._rollout_samples):
             rng = random.Random(seed_base + sample_idx * 7919)
             cur_board = next_board.copy()
             sample_score = 0.0
 
             for d in range(depth - 1):
-                actions = self._generate_valid_swap_actions(cur_board)
+                board_key = cur_board.tobytes()
+                actions = valid_action_cache.get(board_key)
+                if actions is None:
+                    actions = tuple(self._generate_valid_swap_actions(cur_board))
+                    valid_action_cache[board_key] = actions
                 if not actions:
                     break
 
@@ -1267,6 +1639,7 @@ class MatchThreeAgent:
         return immediate_score + self._lookahead_discount * expected_future
 
     def choose_best_action(self, actions, lookahead_depth=3, banned_actions=None):
+        self._sim_cache.clear()
         banned_actions = banned_actions or set()
         self_actions = []
 
@@ -1293,20 +1666,18 @@ class MatchThreeAgent:
             return []
 
         board = self.elem_array.copy()
+        sub_board = self.elem_sub_array.copy() if self.elem_sub_array is not None else None
 
-        # Enforce strict top-level priority:
-        # 5-line / 3+3 cross > 4-line(horizontal) > 3-line.
+        # Enforce strict priority order:
+        # advanced-piece elimination > (5/cross > 4_h > 3) > vertical > lower-board.
         ranked_candidates = []
         for action in candidate_actions:
-            simulated = board.copy()
-            index1, index2 = action
-            simulated[index1], simulated[index2] = simulated[index2], simulated[index1]
-            match_info = self._find_matches(simulated)
-            priority_type, _ = self._classify_match_priority(match_info)
-            ranked_candidates.append((self._priority_rank(priority_type), action))
+            key = self._action_priority_key(board, sub_board, action)
+            ranked_candidates.append((key, action))
+        ranked_candidates.sort(key=lambda x: x[0], reverse=True)
 
-        max_rank = max(rank for rank, _ in ranked_candidates)
-        candidate_actions = [action for rank, action in ranked_candidates if rank == max_rank]
+        # Keep a small frontier of best rule-ranked actions for simulation.
+        candidate_actions = [action for _, action in ranked_candidates[:max(self._root_evaluation_cap * 2, 8)]]
 
         # Root pruning by immediate score to keep runtime bounded.
         immediate_ranked = []
@@ -1329,14 +1700,15 @@ class MatchThreeAgent:
     def take_action(self, action):
         def swap_element(index1, index2):
             if index1 == index2:
-                pyautogui.click(index1[0], index1[1])
                 return
-            # Use a deliberate drag gesture to improve swap reliability.
-            pyautogui.moveTo(index1[0], index1[1], duration=0.04)
+
+            # Conservative drag: press firmly first, then move, then release.
+            pyautogui.moveTo(index1[0], index1[1], duration=0.05)
+            time.sleep(0.012)
             pyautogui.mouseDown()
-            time.sleep(0.025)
+            time.sleep(max(DEFAULT_DRAG_HOLD_BEFORE_MOVE, 0.035))
             pyautogui.moveTo(index2[0], index2[1], duration=0.18)
-            time.sleep(0.015)
+            time.sleep(max(DEFAULT_DRAG_HOLD_AFTER_MOVE, 0.060))
             pyautogui.mouseUp()
 
         if not action:
@@ -1348,6 +1720,22 @@ class MatchThreeAgent:
         time.sleep(self._action_delay)
         return action
 
+    def retry_action(self, action):
+        if not action:
+            return False
+        screen_index1, screen_index2 = self._grid_location[action[0]], self._grid_location[action[1]]
+
+        # Fallback: same conservative drag with longer hold.
+        pyautogui.moveTo(screen_index1[0], screen_index1[1], duration=0.06)
+        time.sleep(0.015)
+        pyautogui.mouseDown()
+        time.sleep(max(DEFAULT_DRAG_HOLD_BEFORE_MOVE, 0.045))
+        pyautogui.moveTo(screen_index2[0], screen_index2[1], duration=0.24)
+        time.sleep(max(DEFAULT_DRAG_HOLD_AFTER_MOVE_RETRY, 0.075))
+        pyautogui.mouseUp()
+        time.sleep(min(0.35, max(0.16, self._action_delay * 0.8)))
+        return True
+
     def get_confidence_score(self):
         return np.mean(self._scores)
 
@@ -1355,7 +1743,13 @@ class MatchThreeAgent:
 def run(wait_static, show, action_delay, lookahead_depth, disable_wait_settle, settle_timeout,
         perf=False, perf_every=DEFAULT_PERF_SUMMARY_EVERY,
         auto_recalibrate=DEFAULT_AUTO_RECALIBRATE,
-        recalibrate_interval=DEFAULT_RECALIBRATE_INTERVAL):
+        recalibrate_interval=DEFAULT_RECALIBRATE_INTERVAL,
+        idle_poll_interval=DEFAULT_IDLE_POLL_INTERVAL,
+        confidence_pause_threshold=DEFAULT_CONFIDENCE_PAUSE_THRESHOLD,
+        confidence_pause_streak=DEFAULT_CONFIDENCE_PAUSE_STREAK,
+        confidence_resume_threshold=DEFAULT_CONFIDENCE_RESUME_THRESHOLD,
+        confidence_resume_streak=DEFAULT_CONFIDENCE_RESUME_STREAK,
+        recalibrate_cooldown_cycles=DEFAULT_RECALIBRATE_COOLDOWN_CYCLES):
     wait_for_start_signal()
 
     cur_path = sys.argv[0]
@@ -1372,7 +1766,12 @@ def run(wait_static, show, action_delay, lookahead_depth, disable_wait_settle, s
         elem_images,
         action_delay=action_delay,
         auto_recalibrate=auto_recalibrate,
-        recalibrate_interval=recalibrate_interval
+        recalibrate_interval=recalibrate_interval,
+        confidence_pause_threshold=confidence_pause_threshold,
+        confidence_pause_streak=confidence_pause_streak,
+        confidence_resume_threshold=confidence_resume_threshold,
+        confidence_resume_streak=confidence_resume_streak,
+        recalibrate_cooldown_cycles=recalibrate_cooldown_cycles
     )
     perf_tracker = PerfTracker(enabled=perf, summary_every=perf_every)
     agent.set_perf_tracker(perf_tracker)
@@ -1389,7 +1788,8 @@ def run(wait_static, show, action_delay, lookahead_depth, disable_wait_settle, s
                 settle_timeout=settle_timeout,
                 last_board_signature=last_board_signature,
                 last_action=last_action,
-                perf_tracker=perf_tracker
+                perf_tracker=perf_tracker,
+                idle_poll_interval=idle_poll_interval
             )
             if should_stop:
                 break
@@ -1408,6 +1808,8 @@ def build_arg_parser():
                         help='show the identified board image for debugging', action="store_true")
     common.add_argument('--action_delay', type=float, default=DEFAULT_ACTION_DELAY,
                         help=f'delay after each swap action in seconds (default: {DEFAULT_ACTION_DELAY})')
+    common.add_argument('--idle_poll_interval', type=float, default=DEFAULT_IDLE_POLL_INTERVAL,
+                        help=f'poll interval in seconds for paused/idle cycles (default: {DEFAULT_IDLE_POLL_INTERVAL})')
 
     advanced = parser.add_argument_group("Advanced")
     advanced.add_argument('--lookahead_depth', type=int, default=DEFAULT_LOOKAHEAD_DEPTH,
@@ -1420,10 +1822,20 @@ def build_arg_parser():
                           help='disable auto recalibration based on board recognition feedback')
     advanced.add_argument('--recalibrate_interval', type=int, default=DEFAULT_RECALIBRATE_INTERVAL,
                           help=f'run auto recalibration every N cycles (default: {DEFAULT_RECALIBRATE_INTERVAL})')
+    advanced.add_argument('--recalibrate_cooldown_cycles', type=int, default=DEFAULT_RECALIBRATE_COOLDOWN_CYCLES,
+                          help='minimum cycle gap between two auto recalibration attempts')
     advanced.add_argument('--perf', action="store_true",
                           help='enable per-step runtime profiling and periodic summary logs')
     advanced.add_argument('--perf_every', type=int, default=DEFAULT_PERF_SUMMARY_EVERY,
                           help=f'print perf summary every N cycles (default: {DEFAULT_PERF_SUMMARY_EVERY})')
+    advanced.add_argument('--confidence_pause_threshold', type=float, default=DEFAULT_CONFIDENCE_PAUSE_THRESHOLD,
+                          help='treat recognition as paused when confidence deviation is above this threshold')
+    advanced.add_argument('--confidence_pause_streak', type=int, default=DEFAULT_CONFIDENCE_PAUSE_STREAK,
+                          help='consecutive high-deviation cycles required before pausing actions')
+    advanced.add_argument('--confidence_resume_threshold', type=float, default=DEFAULT_CONFIDENCE_RESUME_THRESHOLD,
+                          help='deviation threshold to exit auto-pause mode (hysteresis lower bound)')
+    advanced.add_argument('--confidence_resume_streak', type=int, default=DEFAULT_CONFIDENCE_RESUME_STREAK,
+                          help='consecutive low-deviation cycles required to exit auto-pause mode')
     return parser
 
 
@@ -1447,7 +1859,13 @@ if __name__ == "__main__":
             perf=args.perf,
             perf_every=max(1, args.perf_every),
             auto_recalibrate=(not args.disable_auto_recalibrate),
-            recalibrate_interval=max(1, args.recalibrate_interval)
+            recalibrate_interval=max(1, args.recalibrate_interval),
+            recalibrate_cooldown_cycles=max(1, int(args.recalibrate_cooldown_cycles)),
+            idle_poll_interval=max(0.05, args.idle_poll_interval),
+            confidence_pause_threshold=max(0.0, float(args.confidence_pause_threshold)),
+            confidence_pause_streak=max(1, int(args.confidence_pause_streak)),
+            confidence_resume_threshold=max(0.0, float(args.confidence_resume_threshold)),
+            confidence_resume_streak=max(1, int(args.confidence_resume_streak))
         )
     except KeyboardInterrupt:
         stop_agent = True
