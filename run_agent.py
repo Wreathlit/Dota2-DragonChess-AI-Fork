@@ -1,12 +1,13 @@
 import os
-import sys
 import random
 import time
 import ctypes
 import zlib
+import threading
 from ctypes import wintypes
 from collections import defaultdict
 import argparse
+from pathlib import Path
 import cv2
 import numpy as np
 import pyautogui
@@ -18,9 +19,9 @@ except ImportError:
     mss = None
 
 
-start_agent = False
-stop_agent = False
-pause_agent = False
+start_event = threading.Event()
+stop_event = threading.Event()
+pause_event = threading.Event()
 DEFAULT_WINDOW_TITLES = ["Dota 2"]
 WINDOW_TITLE_EXCLUDES = ["visual studio code", "cursor", "pycharm", "notepad++", "sublime text"]
 DEFAULT_MATCH_CONFIDENCE = 0.72
@@ -29,6 +30,8 @@ DEFAULT_LOOKAHEAD_DEPTH = 3
 DEFAULT_SETTLE_TIMEOUT = 1.6
 DEFAULT_PERF_SUMMARY_EVERY = 10
 DEFAULT_IDLE_POLL_INTERVAL = 0.3
+DEFAULT_VERBOSE_CYCLE_LOG = False
+DEFAULT_BOARD_RELOCATE_RETRY_INTERVAL = 0.5
 DEFAULT_SETTLE_POLL_INTERVAL = 0.035
 DEFAULT_SETTLE_STABLE_FRAMES = 3
 DEFAULT_SETTLE_DIFF_THRESHOLD = 2.4
@@ -70,7 +73,7 @@ class PerfTracker:
     def __init__(self, enabled=False, summary_every=10):
         self.enabled = bool(enabled)
         self.summary_every = max(1, int(summary_every))
-        self._metrics = defaultdict(list)
+        self._metrics = {}
         self._cycles = 0
         self._action_cycles = 0
         self._skipped_cycles = 0
@@ -78,7 +81,12 @@ class PerfTracker:
     def add(self, name, seconds):
         if not self.enabled:
             return
-        self._metrics[name].append(float(seconds) * 1000.0)
+        ms = float(seconds) * 1000.0
+        stats = self._metrics.setdefault(name, {"count": 0, "sum_ms": 0.0, "max_ms": 0.0})
+        stats["count"] += 1
+        stats["sum_ms"] += ms
+        if ms > stats["max_ms"]:
+            stats["max_ms"] = ms
 
     def mark_cycle(self, action_taken=False, skipped=False):
         if not self.enabled:
@@ -98,27 +106,27 @@ class PerfTracker:
         print("\n[PERF] ===== cycle profile summary =====")
         print(f"[PERF] cycles={self._cycles}, action_cycles={self._action_cycles}, skipped={self._skipped_cycles}")
         for name in sorted(self._metrics.keys()):
-            values = self._metrics[name]
-            if not values:
+            stats = self._metrics[name]
+            if stats["count"] <= 0:
                 continue
-            avg_ms = sum(values) / len(values)
-            max_ms = max(values)
-            print(f"[PERF] {name}: avg={avg_ms:.2f}ms max={max_ms:.2f}ms count={len(values)}")
+            avg_ms = stats["sum_ms"] / stats["count"]
+            max_ms = stats["max_ms"]
+            print(f"[PERF] {name}: avg={avg_ms:.2f}ms max={max_ms:.2f}ms count={stats['count']}")
         print("[PERF] =================================")
 
 
 def on_press(key):
-    global start_agent
-    global stop_agent
-    global pause_agent
     try:
         if key.char == 'b':
-            start_agent = True
+            start_event.set()
         elif key.char in ('p', 'q'):
-            pause_agent = not pause_agent
+            if pause_event.is_set():
+                pause_event.clear()
+            else:
+                pause_event.set()
     except AttributeError:
-        if start_agent and key == Key.esc:
-            stop_agent = True
+        if start_event.is_set() and key == Key.esc:
+            stop_event.set()
             # return False
 
 
@@ -320,14 +328,22 @@ def find_game_board(resource_dir, search_region=None, confidence=0.72):
         return None, None
 
     side_x, side_y = (w - x), (h - y)
-    side_min = min(side_x, side_y)
-    side_max = max(side_x, side_y)
-    aspect_error = abs(side_x - side_y) / max(side_x, side_y)
-    if aspect_error > 0.18:
-        side = min(side_x, side_y)
-        bottom_right = (x + side, y + side)
-        side_min = side
-        side_max = side
+    side = int(round((side_x + side_y) / 2.0))
+    side = max(8, int(round(side / 8.0)) * 8)
+    cx = int(round((x + w) / 2.0))
+    cy = int(round((y + h) / 2.0))
+    x = int(round(cx - side / 2.0))
+    y = int(round(cy - side / 2.0))
+
+    if search_region is not None:
+        region_x, region_y, region_w, region_h = search_region
+        x = max(region_x, min(x, region_x + region_w - side))
+        y = max(region_y, min(y, region_y + region_h - side))
+
+    top_left = (x, y)
+    bottom_right = (x + side, y + side)
+    side_min = side
+    side_max = side
 
     # Filter obvious false positives: board is a large square in the window.
     if side_min < 300:
@@ -350,6 +366,7 @@ def resolve_board_coordinates(resource_dir):
     # Identify the game board from the screen
     while True:
         search_region = get_window_rect_by_title()
+        # Use legacy corner template matching directly (topLeft.jpg + botRight.jpg).
         top_left, bottom_right = find_game_board(
             resource_dir,
             search_region=search_region,
@@ -359,7 +376,7 @@ def resolve_board_coordinates(resource_dir):
             if search_region is None:
                 print('Cannot locate Dota2 window, fallback to full screen board matching.')
             print('Cannot locate the game board, make sure the game is on the screen.')
-            time.sleep(5)
+            time.sleep(DEFAULT_BOARD_RELOCATE_RETRY_INTERVAL)
         else:
             return top_left, bottom_right
 
@@ -443,20 +460,20 @@ def print_cycle_log(elem_array, elem_sub_array, action, confidence_score, elapse
 
 
 def wait_for_start_signal():
-    while not start_agent:
-        time.sleep(1)
-    pyautogui.click(interval=0.5)
-    time.sleep(4)
+    while not start_event.is_set():
+        time.sleep(0.05)
+    pyautogui.click()
 
 
 def run_main_cycle(agent, wait_static, lookahead_depth, disable_wait_settle, settle_timeout,
                    last_board_signature, last_action, perf_tracker=None,
-                   idle_poll_interval=DEFAULT_IDLE_POLL_INTERVAL):
-    if stop_agent:
+                   idle_poll_interval=DEFAULT_IDLE_POLL_INTERVAL,
+                   verbose_cycle_log=DEFAULT_VERBOSE_CYCLE_LOG):
+    if stop_event.is_set():
         print("Program stopped by user.")
         return True, last_board_signature, last_action
 
-    if pause_agent:
+    if pause_event.is_set():
         print("Program paused by user. Press 'p' or 'q' again to unpause.")
         time.sleep(max(0.05, float(idle_poll_interval)))
         return False, last_board_signature, last_action
@@ -551,13 +568,14 @@ def run_main_cycle(agent, wait_static, lookahead_depth, disable_wait_settle, set
         perf_tracker.add("cycle_total", time.perf_counter() - t_cycle)
         perf_tracker.mark_cycle(action_taken=bool(action), skipped=False)
 
-    print_cycle_log(
-        elem_array=agent.elem_array,
-        elem_sub_array=agent.elem_sub_array,
-        action=action,
-        confidence_score=avg_confidence_score,
-        elapsed_sec=time.time() - t1
-    )
+    if verbose_cycle_log:
+        print_cycle_log(
+            elem_array=agent.elem_array,
+            elem_sub_array=agent.elem_sub_array,
+            action=action,
+            confidence_score=avg_confidence_score,
+            elapsed_sec=time.time() - t1
+        )
     return False, board_signature, action
 
 
@@ -849,10 +867,11 @@ class MatchThreeAgent:
         self._bottom_right = bottom_right
         self._scores = [1] * self.ROW_NUM * self.COL_NUM
         self._action_delay = action_delay
-        self._lookahead_discount = 0.72
-        self._rollout_samples = 8
-        self._rollout_topk = 4
-        self._root_evaluation_cap = 6
+        self._lookahead_discount = 0.76
+        self._rollout_samples = 10
+        self._rollout_topk = 5
+        self._root_evaluation_cap = 8
+        self._strategy_time_budget_ms = 220.0
         self._auto_recalibrate = bool(auto_recalibrate)
         self._recalibrate_interval = max(1, int(recalibrate_interval))
         self._cycle_index = 0
@@ -1014,8 +1033,7 @@ class MatchThreeAgent:
         return grids
 
     def _count_action_candidates_on_board(self, board_array):
-        self.elem_array = board_array
-        return len(self.get_action())
+        return len(self.get_action(board=board_array))
 
     def try_recalibrate_region(self, current_score):
         x1, y1 = self._top_left
@@ -1224,12 +1242,17 @@ class MatchThreeAgent:
     def grid_index_subtract(self, index1, index2):
         return index1[0] - index2[0], index1[1] - index2[1]
 
-    def get_action(self):
+    def get_action(self, board=None):
+        board_arr = self.elem_array if board is None else board
+
+        def in_bounds(index):
+            return 0 <= index[0] < self.ROW_NUM and 0 <= index[1] < self.COL_NUM
+
         def equal_match_value(index1, index2):
-            return index1 in cur_grid_lst and index2 in cur_grid_lst and ar_match[index1] == ar_match[index2]
+            return in_bounds(index1) and in_bounds(index2) and ar_match[index1] == ar_match[index2]
 
         def index_could_swap(index):
-            return index in cur_grid_lst and ar_swap[index]
+            return in_bounds(index) and ar_swap[index]
 
         def normalized_pair(index1, index2):
             a = (int(index1[0]), int(index1[1]))
@@ -1243,12 +1266,8 @@ class MatchThreeAgent:
                 # Keep first-discovered direction to avoid random reversal from set ordering.
                 action_map[key] = action
 
-        cur_grid_lst = [(i, j) for i in range(0, self.ROW_NUM) for j in range(0, self.COL_NUM)]
-        ar_swap = np.zeros((self.ROW_NUM, self.COL_NUM))
-        ar_match = np.zeros((self.ROW_NUM, self.COL_NUM))
-        for index in cur_grid_lst:
-            ar_swap[index] = self.elem_array[index]
-            ar_match[index] = self.elem_array[index]
+        ar_swap = np.asarray(board_arr)
+        ar_match = ar_swap
 
         action_map = {}
         for i, j in np.argwhere(np.logical_and(ar_match[:, :-1] == ar_match[:, 1:], ar_match[:, :-1] != 0)):
@@ -1460,7 +1479,7 @@ class MatchThreeAgent:
         match_info = self._find_matches(simulated)
         matched_cells = match_info["matched_cells"]
         if not matched_cells:
-            return (-1, -1, -1, -1, -1.0, -1)
+            return (-1, -1, -1, -1, -1, -1, -1, -1, -1.0, -1)
 
         # 1) Advanced-piece elimination priority.
         best_advanced_tier = 0
@@ -1521,6 +1540,33 @@ class MatchThreeAgent:
                 else:
                     new_board[row, col] = rng.choice(fill_values)
         return new_board
+
+    def _board_potential_score(self, board):
+        # Cheap approximation of future tactical space: more valid swaps and more lower-board opportunities.
+        actions = self.get_action(board=board)
+        if not actions:
+            return -40.0
+        lower_pressure = 0.0
+        for a, b in actions[:16]:
+            lower_pressure += (a[0] + b[0]) * 0.5
+        lower_term = lower_pressure / max(1.0, float(min(16, len(actions))))
+        return float(len(actions)) * 11.0 + lower_term * 1.8
+
+    def _combo_bonus_from_subboard(self, sub_board, action):
+        if sub_board is None:
+            return 0.0
+        index1, index2 = action
+        tier1 = self._advanced_piece_tier(sub_board[index1])
+        tier2 = self._advanced_piece_tier(sub_board[index2])
+        top = max(tier1, tier2)
+        total = tier1 + tier2
+        if top >= 4:
+            return 950.0 + total * 60.0
+        if top >= 3:
+            return 520.0 + total * 45.0
+        if total >= 3:
+            return 260.0 + total * 30.0
+        return total * 35.0
 
     def _simulate_action(self, board, action, depth):
         cache_key = None
@@ -1591,7 +1637,7 @@ class MatchThreeAgent:
                         actions.append(((i, j), (ni, nj)))
         return actions
 
-    def _evaluate_action_expectimax_lite(self, board, action, depth):
+    def _evaluate_action_expectimax_lite(self, board, action, depth, rollout_samples=None):
         immediate_score, next_board = self._simulate_action(board, action, depth)
         if next_board is None or depth <= 1:
             return immediate_score
@@ -1602,9 +1648,10 @@ class MatchThreeAgent:
             idx1[0] * 10007 + idx1[1] * 10009 + idx2[0] * 10037 + idx2[1] * 10039 + depth * 10061
         ) & 0xffffffff
 
+        sample_budget = self._rollout_samples if rollout_samples is None else max(1, int(rollout_samples))
         rollout_sum = 0.0
         valid_action_cache = {}
-        for sample_idx in range(self._rollout_samples):
+        for sample_idx in range(sample_budget):
             rng = random.Random(seed_base + sample_idx * 7919)
             cur_board = next_board.copy()
             sample_score = 0.0
@@ -1635,7 +1682,7 @@ class MatchThreeAgent:
 
             rollout_sum += sample_score
 
-        expected_future = rollout_sum / max(1, self._rollout_samples)
+        expected_future = rollout_sum / float(max(1, sample_budget))
         return immediate_score + self._lookahead_discount * expected_future
 
     def choose_best_action(self, actions, lookahead_depth=3, banned_actions=None):
@@ -1667,6 +1714,8 @@ class MatchThreeAgent:
 
         board = self.elem_array.copy()
         sub_board = self.elem_sub_array.copy() if self.elem_sub_array is not None else None
+        eval_depth = max(1, int(lookahead_depth))
+        t_start = time.perf_counter()
 
         # Enforce strict priority order:
         # advanced-piece elimination > (5/cross > 4_h > 3) > vertical > lower-board.
@@ -1677,20 +1726,45 @@ class MatchThreeAgent:
         ranked_candidates.sort(key=lambda x: x[0], reverse=True)
 
         # Keep a small frontier of best rule-ranked actions for simulation.
-        candidate_actions = [action for _, action in ranked_candidates[:max(self._root_evaluation_cap * 2, 8)]]
+        frontier_cap = max(self._root_evaluation_cap * 3, 10)
+        candidate_actions = [action for _, action in ranked_candidates[:frontier_cap]]
 
-        # Root pruning by immediate score to keep runtime bounded.
+        # Root pruning by immediate quality to keep runtime bounded.
         immediate_ranked = []
         for action in candidate_actions:
-            s, _ = self._simulate_action(board, action, max(1, lookahead_depth))
-            immediate_ranked.append((s, action))
+            s, next_board = self._simulate_action(board, action, eval_depth)
+            if next_board is None:
+                immediate_ranked.append((s, action))
+                continue
+            score = float(s)
+            score += 0.55 * self._board_potential_score(next_board)
+            score += self._combo_bonus_from_subboard(sub_board, action)
+            immediate_ranked.append((score, action))
         immediate_ranked.sort(key=lambda x: x[0], reverse=True)
         candidate_actions = [a for _, a in immediate_ranked[:self._root_evaluation_cap]]
 
         best_action = None
         best_score = -10**9
-        for action in candidate_actions:
-            score = self._evaluate_action_expectimax_lite(board, action, max(1, lookahead_depth))
+        for idx, action in enumerate(candidate_actions):
+            elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+            if elapsed_ms >= self._strategy_time_budget_ms and idx > 0:
+                break
+
+            rollout_samples = self._rollout_samples
+            if len(candidate_actions) >= 7:
+                # Keep latency bounded when action frontier is wide.
+                rollout_samples = max(6, self._rollout_samples - 2)
+
+            score = self._evaluate_action_expectimax_lite(
+                board,
+                action,
+                eval_depth,
+                rollout_samples=rollout_samples
+            )
+            _, next_board = self._simulate_action(board, action, eval_depth)
+            if next_board is not None:
+                score += 0.16 * self._board_potential_score(next_board)
+                score += 0.22 * self._combo_bonus_from_subboard(sub_board, action)
             if score > best_score:
                 best_score = score
                 best_action = action
@@ -1745,6 +1819,7 @@ def run(wait_static, show, action_delay, lookahead_depth, disable_wait_settle, s
         auto_recalibrate=DEFAULT_AUTO_RECALIBRATE,
         recalibrate_interval=DEFAULT_RECALIBRATE_INTERVAL,
         idle_poll_interval=DEFAULT_IDLE_POLL_INTERVAL,
+        verbose=DEFAULT_VERBOSE_CYCLE_LOG,
         confidence_pause_threshold=DEFAULT_CONFIDENCE_PAUSE_THRESHOLD,
         confidence_pause_streak=DEFAULT_CONFIDENCE_PAUSE_STREAK,
         confidence_resume_threshold=DEFAULT_CONFIDENCE_RESUME_THRESHOLD,
@@ -1752,9 +1827,8 @@ def run(wait_static, show, action_delay, lookahead_depth, disable_wait_settle, s
         recalibrate_cooldown_cycles=DEFAULT_RECALIBRATE_COOLDOWN_CYCLES):
     wait_for_start_signal()
 
-    cur_path = sys.argv[0]
-    cur_dir = os.path.dirname(cur_path)
-    resource_dir = os.path.join(cur_dir, 'resource')
+    cur_dir = Path(__file__).resolve().parent
+    resource_dir = str(cur_dir / 'resource')
 
     top_left, bottom_right = resolve_board_coordinates(resource_dir=resource_dir)
     show_board_if_needed(show, top_left, bottom_right)
@@ -1789,7 +1863,8 @@ def run(wait_static, show, action_delay, lookahead_depth, disable_wait_settle, s
                 last_board_signature=last_board_signature,
                 last_action=last_action,
                 perf_tracker=perf_tracker,
-                idle_poll_interval=idle_poll_interval
+                idle_poll_interval=idle_poll_interval,
+                verbose_cycle_log=bool(verbose)
             )
             if should_stop:
                 break
@@ -1810,6 +1885,8 @@ def build_arg_parser():
                         help=f'delay after each swap action in seconds (default: {DEFAULT_ACTION_DELAY})')
     common.add_argument('--idle_poll_interval', type=float, default=DEFAULT_IDLE_POLL_INTERVAL,
                         help=f'poll interval in seconds for paused/idle cycles (default: {DEFAULT_IDLE_POLL_INTERVAL})')
+    common.add_argument('--verbose', action="store_true",
+                        help='print detailed board/action log for every cycle (debug use)')
 
     advanced = parser.add_argument_group("Advanced")
     advanced.add_argument('--lookahead_depth', type=int, default=DEFAULT_LOOKAHEAD_DEPTH,
@@ -1853,7 +1930,7 @@ if __name__ == "__main__":
             wait_static=args.wait_static,
             show=args.show_board,
             action_delay=max(0.0, args.action_delay),
-            lookahead_depth=min(DEFAULT_LOOKAHEAD_DEPTH, max(1, args.lookahead_depth)),
+            lookahead_depth=max(1, args.lookahead_depth),
             disable_wait_settle=args.disable_wait_settle,
             settle_timeout=max(0.3, args.settle_timeout),
             perf=args.perf,
@@ -1862,13 +1939,14 @@ if __name__ == "__main__":
             recalibrate_interval=max(1, args.recalibrate_interval),
             recalibrate_cooldown_cycles=max(1, int(args.recalibrate_cooldown_cycles)),
             idle_poll_interval=max(0.05, args.idle_poll_interval),
+            verbose=bool(args.verbose),
             confidence_pause_threshold=max(0.0, float(args.confidence_pause_threshold)),
             confidence_pause_streak=max(1, int(args.confidence_pause_streak)),
             confidence_resume_threshold=max(0.0, float(args.confidence_resume_threshold)),
             confidence_resume_streak=max(1, int(args.confidence_resume_streak))
         )
     except KeyboardInterrupt:
-        stop_agent = True
+        stop_event.set()
         print("KeyboardInterrupt received, exiting...")
     except Exception as e:
         print('An error occurred: {}'.format(e))
